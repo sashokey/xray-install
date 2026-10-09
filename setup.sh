@@ -552,6 +552,7 @@ verify_installation() {
 }
 
 print_client() {
+    printf '\nUUID: %s\n' "$VLESS_CLIENT_UUID"
     printf '\nClient connection:\n'
     printf 'vless://%s@%s:443?flow=xtls-rprx-vision&security=tls&alpn=h2&fp=firefox\n' \
         "$VLESS_CLIENT_UUID" "$PROJECT_DOMAIN"
@@ -571,6 +572,7 @@ remove_ssh_and_reboot() {
     [[ -z "$(ss -H -ltn 'sport = :22')" ]] || fail 'Port 22 is still listening.'
     printf '\nSetup verified. SSH removed. Rebooting in 10 seconds.\n'
     systemd-run --unit=xray-setup-reboot --on-active=10s /usr/bin/systemctl reboot
+    print_client
 }
 
 main() {

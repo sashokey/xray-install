@@ -1,14 +1,7 @@
-> Works on **Debian 13 (Trixie)** only.
+> Clean Debian 13 (Trixie), root. Point the domain A record to the server; remove its AAAA record.
 
 ```bash
-curl -fsSL "https://gitlab.com/unrig/xray-starter/-/raw/main/setup.sh" -o setup.sh && chmod +x setup.sh && sudo ./setup.sh
+curl -4fsSL https://raw.githubusercontent.com/sashokey/xray-install/main/setup.sh -o setup.sh && bash setup.sh
 ```
 
-```
-vless://{uuid}@{domain}:443?flow=xtls-rprx-vision&security=tls&alpn=h2&fp=firefox
-```
-
-fix vps shit
-```bash
-curl -fsSL "https://gitlab.com/unrig/xray-starter/-/raw/main/neutralize-cloud-network-init.sh" -o neutralize-cloud-network-init.sh && chmod +x neutralize-cloud-network-init.sh && sudo ./neutralize-cloud-network-init.sh
-```
+Enter the domain and generate or enter a UUID. Save the displayed VLESS link. The script removes SSH and reboots after successful checks.

@@ -122,10 +122,48 @@ lock_setup() {
 }
 
 install_packages() {
+    local -a packages=(nginx certbot curl ca-certificates python3 unzip openssl dnsutils kmod cron nftables)
+    if [[ "$NETWORK_BACKEND" == netplan ]]; then
+        packages+=(python3-yaml)
+    fi
     apt-get -o Acquire::ForceIPv4=true update
     apt-get -o DPkg::Lock::Timeout=-1 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
-        nginx certbot curl ca-certificates python3 python3-yaml unzip openssl \
-        dnsutils kmod cron nftables
+        "${packages[@]}"
+}
+
+remove_unused_packages() {
+    local package
+    local -a selected=()
+    local -a candidates=(
+        apt-listchanges bash-completion debian-faq doc-debian installation-report laptop-detect
+        inetutils-telnet netcat-traditional reportbug python3-reportbug tasksel tasksel-data task-english
+        man-db manpages groff-base ispell iamerican ibritish ienglish-common wamerican
+        dictionaries-common emacsen-common vim vim-common vim-runtime vim-tiny
+        xauth xdg-user-dirs wget haveged
+    )
+    if [[ "$NETWORK_BACKEND" == ifupdown ]]; then
+        candidates+=(dhcpcd-base python3-yaml)
+    fi
+    for package in "${candidates[@]}"; do
+        if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" == installed ]]; then
+            selected+=("$package")
+        fi
+    done
+    [[ ${#selected[@]} -gt 0 ]] || return 0
+    LC_ALL=C apt-get -s --auto-remove purge -- "${selected[@]}" > "$TEMP_DIR/cleanup-plan"
+    while read -r package; do
+        case "$package" in
+            apt|dpkg|bash|coreutils|systemd*|udev|dbus*|linux-*|grub*|initramfs-*|ifupdown|netplan.io|iproute2|openssh-*|qemu-guest-agent|console-setup*|keyboard-configuration|nano|nginx*|certbot|python3|python3-minimal|curl|ca-certificates|unzip|openssl|dnsutils|bind9-dnsutils|kmod|cron*|nftables)
+                fail "Package cleanup would remove a required component: $package"
+                ;;
+        esac
+    done < <(awk '$1 == "Remv" || $1 == "Purg" {print $2}' "$TEMP_DIR/cleanup-plan")
+    apt-get -o DPkg::Lock::Timeout=-1 --auto-remove purge -y -- "${selected[@]}"
+    for package in "${selected[@]}"; do
+        if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" == installed ]]; then
+            fail "An unused package is still installed: $package"
+        fi
+    done
 }
 
 configure_ifupdown() {
@@ -634,7 +672,6 @@ table inet xray {
         iifname "lo" accept
         ct state invalid drop
         ct state established,related accept
-        udp sport 67 udp dport 68 accept
         icmp type { destination-unreachable, time-exceeded, parameter-problem, echo-request } accept
         tcp dport { 80, 443 } accept
     }
@@ -647,6 +684,9 @@ table inet xray {
     }
 }
 EOF
+    if [[ "$NETWORK_BACKEND" == netplan ]]; then
+        sed -i '/ct state established,related accept/a\        udp sport 67 udp dport 68 accept' "$TEMP_DIR/nftables.conf"
+    fi
     nft --check --file "$TEMP_DIR/nftables.conf"
     install -m 600 "$TEMP_DIR/nftables.conf" /etc/nftables.conf
     nft --file /etc/nftables.conf
@@ -688,13 +728,16 @@ remove_ssh_and_reboot() {
     step 'Removing the SSH server'
     systemctl disable --now ssh.socket 2>/dev/null || true
     systemctl stop sshd-unix-local.socket 2>/dev/null || true
-    apt-get -o DPkg::Lock::Timeout=-1 purge -y openssh-server openssh-sftp-server
+    apt-get -o DPkg::Lock::Timeout=-1 --auto-remove purge -y openssh-server openssh-sftp-server openssh-client
     install -d -m 755 /etc/systemd/system-generators
     ln -sfn /dev/null /etc/systemd/system-generators/systemd-ssh-generator
     systemctl mask ssh.service sshd.service ssh.socket sshd-unix-local.socket
-    if dpkg-query -W -f='${db:Status-Status}\n' openssh-server 2>/dev/null | grep -qx installed; then
-        fail 'The SSH server is still installed.'
-    fi
+    local package
+    for package in openssh-server openssh-sftp-server openssh-client; do
+        if dpkg-query -W -f='${db:Status-Status}\n' "$package" 2>/dev/null | grep -qx installed; then
+            fail "An SSH package is still installed: $package"
+        fi
+    done
     [[ -z "$(ss -H -ltn 'sport = :22')" ]] || fail 'Port 22 is still listening.'
     printf '\nSetup verified. SSH removed. Rebooting in 10 seconds.\n'
     systemd-run --unit=xray-setup-reboot --on-active=10s /usr/bin/systemctl reboot
@@ -930,6 +973,8 @@ main() {
     install_packages
     step 'Configuring IPv4-only networking and DNS'
     configure_network
+    step 'Removing unused image packages'
+    remove_unused_packages
     configure_bbr
     check_domain_dns
     check_main_address

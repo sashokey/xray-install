@@ -606,11 +606,10 @@ config = {
                 }]
             }
         },
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}
+        "sniffing": {"enabled": False}
     }],
     "outbounds": [
-        main_outbound,
-        {"protocol": "blackhole", "tag": "block"}
+        main_outbound
     ],
     "dns": {
         "servers": [
@@ -621,11 +620,8 @@ config = {
         "queryStrategy": "UseIPv4"
     },
     "routing": {
-        "rules": [
-            {"type": "field", "domain": ["geosite:category-gov-ru", "domain:ru", "domain:xn--p1ai"], "outboundTag": "block"},
-            {"type": "field", "ip": ["geoip:ru"], "outboundTag": "block"}
-        ],
-        "domainStrategy": "IPIfNonMatch"
+        "rules": [],
+        "domainStrategy": "AsIs"
     }
 }
 Path(target).write_text(json.dumps(config, indent=2) + "\n")

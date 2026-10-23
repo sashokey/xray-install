@@ -442,11 +442,10 @@ config = {
                 }]
             }
         },
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}
+        "sniffing": {"enabled": False}
     }],
     "outbounds": [
-        {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}},
-        {"protocol": "blackhole", "tag": "block"}
+        {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}}
     ],
     "dns": {
         "servers": [
@@ -457,11 +456,8 @@ config = {
         "queryStrategy": "UseIPv4"
     },
     "routing": {
-        "rules": [
-            {"type": "field", "domain": ["geosite:category-gov-ru", "domain:ru", "domain:xn--p1ai"], "outboundTag": "block"},
-            {"type": "field", "ip": ["geoip:ru"], "outboundTag": "block"}
-        ],
-        "domainStrategy": "IPIfNonMatch"
+        "rules": [],
+        "domainStrategy": "AsIs"
     }
 }
 Path(target).write_text(json.dumps(config, indent=2) + "\n")

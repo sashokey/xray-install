@@ -35,7 +35,7 @@ trap 'printf "\nERROR: Setup stopped at line %s. Check the error above before re
 validate_domain() {
     local label
     local -a labels
-    [[ ${#1} -le 253 && "$1" == *.* ]] || return 1
+    [[ ${#1} -le 253 && "$1" == *.* && "$1" != *. ]] || return 1
     IFS='.' read -r -a labels <<< "$1"
     for label in "${labels[@]}"; do
         [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1

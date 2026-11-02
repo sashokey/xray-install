@@ -34,13 +34,13 @@ printf '127.0.0.1 main.example slave.example\n' >> /etc/hosts
 install -d -m 755 /etc/letsencrypt/live/main.example /etc/letsencrypt/live/slave.example
 openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj /CN=main.example \
     -addext subjectAltName=DNS:main.example,DNS:slave.example \
+    -addext basicConstraints=critical,CA:TRUE \
     -keyout "$WORK/test-key.pem" -out "$WORK/test-cert.pem" 2>/dev/null
 for domain in main.example slave.example; do
     install -m 600 "$WORK/test-key.pem" "/etc/letsencrypt/live/$domain/privkey.pem"
     install -m 644 "$WORK/test-cert.pem" "/etc/letsencrypt/live/$domain/fullchain.pem"
 done
 export CURL_CA_BUNDLE="$WORK/test-cert.pem"
-export SSL_CERT_FILE="$WORK/test-cert.pem"
 configure_nginx
 write_xray_config
 cp /usr/local/etc/xray/config.json "$WORK/main.json"
@@ -92,9 +92,12 @@ slave = json.loads((directory / 'slave.json').read_text())
 slave['inbounds'][0]['listen'] = '127.0.0.1'
 slave['inbounds'][0]['port'] = 2443
 slave['log']['loglevel'] = 'debug'
+trust = [{'certificateFile': str(directory / 'test-cert.pem'), 'usage': 'verify'}]
+slave['outbounds'][0]['streamSettings']['tlsSettings']['certificates'] = trust
 (directory / 'slave.json').write_text(json.dumps(slave))
 outbound = json.loads((directory / 'client-outbound.json').read_text())
 outbound['settings']['vnext'][0]['port'] = 2443
+outbound['streamSettings']['tlsSettings']['certificates'] = trust
 client = {'log': {'loglevel': 'debug'}, 'inbounds': [{'listen': '127.0.0.1', 'port': 10808, 'protocol': 'socks', 'settings': {'auth': 'noauth', 'udp': False}}], 'outbounds': [outbound]}
 (directory / 'client.json').write_text(json.dumps(client))
 (directory / 'site').mkdir()

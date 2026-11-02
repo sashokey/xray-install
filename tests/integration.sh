@@ -16,7 +16,7 @@ finish() {
 
 systemctl() {
     if [[ "$1" == restart && "$2" == nginx ]]; then
-        if [[ -f /run/nginx.pid ]]; then
+        if [[ -s /run/nginx.pid ]] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then
             nginx -s reload
         else
             nginx

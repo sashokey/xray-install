@@ -44,6 +44,16 @@ export SSL_CERT_FILE="$WORK/test-cert.pem"
 configure_nginx
 write_xray_config
 cp /usr/local/etc/xray/config.json "$WORK/main.json"
+python3 - "$WORK/main.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
+config['log']['loglevel'] = 'debug'
+path.write_text(json.dumps(config))
+PY
 print_client > "$WORK/main-link.txt"
 /usr/local/bin/xray run -config "$WORK/main.json" > "$WORK/main.log" 2>&1 &
 MAIN_PID=$!
@@ -81,10 +91,11 @@ directory = Path(sys.argv[1])
 slave = json.loads((directory / 'slave.json').read_text())
 slave['inbounds'][0]['listen'] = '127.0.0.1'
 slave['inbounds'][0]['port'] = 2443
+slave['log']['loglevel'] = 'debug'
 (directory / 'slave.json').write_text(json.dumps(slave))
 outbound = json.loads((directory / 'client-outbound.json').read_text())
 outbound['settings']['vnext'][0]['port'] = 2443
-client = {'log': {'loglevel': 'warning'}, 'inbounds': [{'listen': '127.0.0.1', 'port': 10808, 'protocol': 'socks', 'settings': {'auth': 'noauth', 'udp': False}}], 'outbounds': [outbound]}
+client = {'log': {'loglevel': 'debug'}, 'inbounds': [{'listen': '127.0.0.1', 'port': 10808, 'protocol': 'socks', 'settings': {'auth': 'noauth', 'udp': False}}], 'outbounds': [outbound]}
 (directory / 'client.json').write_text(json.dumps(client))
 (directory / 'site').mkdir()
 (directory / 'site' / 'success').write_text('integration-ok')
@@ -99,7 +110,7 @@ PIDS+=("$!")
 python3 -m http.server --bind 127.0.0.1 --directory "$WORK/site" 18080 > "$WORK/target.log" 2>&1 &
 PIDS+=("$!")
 passed=false
-for attempt in {1..30}; do
+for attempt in {1..5}; do
     if body="$(curl --silent --show-error --fail --max-time 3 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success 2>/dev/null)" && [[ "$body" == integration-ok ]]; then
         passed=true
         break
@@ -107,6 +118,7 @@ for attempt in {1..30}; do
     sleep 0.2
 done
 if [[ "$passed" != true ]]; then
+    curl --verbose --max-time 4 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success || true
     cat "$WORK/main.log" "$WORK/slave.log" "$WORK/client.log" >&2
     exit 1
 fi

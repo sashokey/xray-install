@@ -125,10 +125,27 @@ if [[ "$passed" != true ]]; then
     cat "$WORK/main.log" "$WORK/slave.log" "$WORK/client.log" >&2
     exit 1
 fi
+kill "$MAIN_PID"
+wait "$MAIN_PID" 2>/dev/null || true
+if curl --silent --fail --max-time 4 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success >/dev/null; then
+    printf 'The slave unexpectedly bypassed the stopped main server.\n' >&2
+    exit 1
+fi
+/usr/local/bin/xray run -config "$WORK/main.json" > "$WORK/main-restarted.log" 2>&1 &
+PIDS+=("$!")
+passed=false
+for attempt in {1..5}; do
+    if body="$(curl --silent --show-error --fail --max-time 3 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success 2>/dev/null)" && [[ "$body" == integration-ok ]]; then
+        passed=true
+        break
+    fi
+    sleep 0.2
+done
+[[ "$passed" == true ]]
 kill "$SLAVE_PID"
 wait "$SLAVE_PID" 2>/dev/null || true
 if curl --silent --fail --max-time 4 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success >/dev/null; then
     printf 'The client unexpectedly bypassed the stopped slave.\n' >&2
     exit 1
 fi
-printf 'Verified: real TLS/VLESS client -> slave -> main -> HTTP target, and stopping the slave breaks the route.\n'
+printf 'Verified: real TLS/VLESS client -> slave -> main -> HTTP target; stopping either server breaks the route, and restarting main restores it.\n'

@@ -24,12 +24,20 @@ systemctl() {
     fi
 }
 
+request_target() {
+    curl --silent --show-error --fail --max-time 8 --noproxy '' \
+        --cacert /etc/ssl/certs/ca-certificates.crt \
+        --socks5-hostname 127.0.0.1:10808 https://example.com/
+}
+
 source "$ROOT/setup.sh"
 trap finish EXIT
 TEMP_DIR="$WORK"
 PROJECT_DOMAIN=main.example
 VLESS_CLIENT_UUID=01234567-89ab-cdef-0123-456789abcdef
 install_xray
+DIRECT_BODY="$(curl -4 --silent --show-error --fail --max-time 10 --noproxy '*' https://example.com/)"
+[[ "$DIRECT_BODY" == *'<title>Example Domain</title>'* ]]
 printf '127.0.0.1 main.example slave.example\n' >> /etc/hosts
 install -d -m 755 /etc/letsencrypt/live/main.example /etc/letsencrypt/live/slave.example
 openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj /CN=main.example \
@@ -100,8 +108,6 @@ outbound['settings']['vnext'][0]['port'] = 2443
 outbound['streamSettings']['tlsSettings']['certificates'] = trust
 client = {'log': {'loglevel': 'debug'}, 'inbounds': [{'listen': '127.0.0.1', 'port': 10808, 'protocol': 'socks', 'settings': {'auth': 'noauth', 'udp': False}}], 'outbounds': [outbound]}
 (directory / 'client.json').write_text(json.dumps(client))
-(directory / 'site').mkdir()
-(directory / 'site' / 'success').write_text('integration-ok')
 PY
 /usr/local/bin/xray run -test -config "$WORK/slave.json"
 /usr/local/bin/xray run -test -config "$WORK/client.json"
@@ -110,24 +116,22 @@ SLAVE_PID=$!
 PIDS+=("$SLAVE_PID")
 /usr/local/bin/xray run -config "$WORK/client.json" > "$WORK/client.log" 2>&1 &
 PIDS+=("$!")
-python3 -m http.server --bind 127.0.0.1 --directory "$WORK/site" 18080 > "$WORK/target.log" 2>&1 &
-PIDS+=("$!")
 passed=false
 for attempt in {1..5}; do
-    if body="$(curl --silent --show-error --fail --max-time 3 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success 2>/dev/null)" && [[ "$body" == integration-ok ]]; then
+    if body="$(request_target 2>/dev/null)" && [[ "$body" == *'<title>Example Domain</title>'* ]]; then
         passed=true
         break
     fi
     sleep 0.2
 done
 if [[ "$passed" != true ]]; then
-    curl --verbose --max-time 4 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success || true
+    request_target || true
     cat "$WORK/main.log" "$WORK/slave.log" "$WORK/client.log" >&2
     exit 1
 fi
 kill "$MAIN_PID"
 wait "$MAIN_PID" 2>/dev/null || true
-if curl --silent --fail --max-time 4 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success >/dev/null; then
+if request_target >/dev/null 2>&1; then
     printf 'The slave unexpectedly bypassed the stopped main server.\n' >&2
     exit 1
 fi
@@ -135,7 +139,7 @@ fi
 PIDS+=("$!")
 passed=false
 for attempt in {1..5}; do
-    if body="$(curl --silent --show-error --fail --max-time 3 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success 2>/dev/null)" && [[ "$body" == integration-ok ]]; then
+    if body="$(request_target 2>/dev/null)" && [[ "$body" == *'<title>Example Domain</title>'* ]]; then
         passed=true
         break
     fi
@@ -144,8 +148,8 @@ done
 [[ "$passed" == true ]]
 kill "$SLAVE_PID"
 wait "$SLAVE_PID" 2>/dev/null || true
-if curl --silent --fail --max-time 4 --noproxy '' --socks5-hostname 127.0.0.1:10808 http://127.0.0.1:18080/success >/dev/null; then
+if request_target >/dev/null 2>&1; then
     printf 'The client unexpectedly bypassed the stopped slave.\n' >&2
     exit 1
 fi
-printf 'Verified: real TLS/VLESS client -> slave -> main -> HTTP target; stopping either server breaks the route, and restarting main restores it.\n'
+printf 'Verified: real TLS/VLESS client -> slave -> main -> public HTTPS target; stopping either server breaks the route, and restarting main restores it.\n'

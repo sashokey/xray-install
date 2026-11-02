@@ -11,7 +11,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 BASH = os.environ.get('BASH_BIN', shutil.which('bash') or '/bin/bash')
 UUID = '01234567-89ab-cdef-0123-456789abcdef'
-MODERN_BASH = int(subprocess.check_output([BASH, '-c', 'printf %s "${BASH_VERSINFO[0]}"'], text=True)) >= 4
+MODERN_BASH = int(subprocess.check_output([BASH, '-c', 'printf %s "${BASH_VERSINFO[0]}"'], text=True)) >= 5
+if os.environ.get('CI') and not MODERN_BASH:
+    raise RuntimeError('CI requires the supported Debian 13 Bash 5 runtime.')
 
 
 class InstallerTests(unittest.TestCase):
@@ -37,7 +39,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.stdout, 'ready')
                 self.assertEqual(list(self.directory.iterdir()), [])
 
-    @unittest.skipUnless(MODERN_BASH, 'Domain and interactive input checks require the supported Debian Bash 4+ runtime')
+    @unittest.skipUnless(MODERN_BASH, 'Domain and interactive input checks require the supported Debian Bash 5 runtime')
     def test_domain_validation_accepts_only_dns_labels(self):
         for installer in ['setup.sh', 'setup-proxy.sh']:
             for domain, valid in [('main.example', True), ('one-two.example', True), ('xn--bcher-kva.example', True), ('localhost', False), ('a..example', False), ('-a.example', False), ('a-.example', False), ('https://main.example', False), ('a.example/path', False), ('a.123', False), ('a' * 64 + '.example', False)]:
@@ -46,14 +48,14 @@ class InstallerTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, 'valid' if valid else 'invalid')
 
-    @unittest.skipUnless(MODERN_BASH, 'Interactive input checks require the supported Debian Bash 4+ runtime')
+    @unittest.skipUnless(MODERN_BASH, 'Interactive input checks require the supported Debian Bash 5 runtime')
     def test_main_input_rejects_repeated_trailing_domain_dots(self):
         result = self.run_function('setup.sh', 'ask_inputs\nprintf "DOMAIN=%s\\nUUID=%s\\n" "$PROJECT_DOMAIN" "$VLESS_CLIENT_UUID"', stdin='main.example..\nmain.example\nn\n' + UUID + '\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('DOMAIN=main.example\n', result.stdout)
         self.assertNotIn('DOMAIN=main.example.\n', result.stdout)
 
-    @unittest.skipUnless(MODERN_BASH, 'Interactive input checks require the supported Debian Bash 4+ runtime')
+    @unittest.skipUnless(MODERN_BASH, 'Interactive input checks require the supported Debian Bash 5 runtime')
     def test_proxy_input_rejects_repeated_trailing_domain_dots(self):
         link = 'vless://' + UUID + '@main.example:443?security=tls&flow=xtls-rprx-vision&alpn=h2&fp=firefox'
         result = self.run_function('setup-proxy.sh', 'ask_inputs\nprintf "DOMAIN=%s\\n" "$PROJECT_DOMAIN"', stdin='slave.example..\nslave.example\nn\n' + UUID + '\n' + link + '\n')
@@ -89,6 +91,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(outbound['settings']['vnext'][0]['port'], 8443)
         self.assertEqual(outbound['settings']['vnext'][0]['users'][0]['id'], UUID)
         self.assertEqual(outbound['streamSettings']['tlsSettings'], {'serverName': 'main.example', 'alpn': ['h2', 'http/1.1'], 'fingerprint': 'chrome', 'allowInsecure': False})
+
+    def test_proxy_link_rejects_repeated_trailing_hostname_dots(self):
+        for host, sni in [('main.example..', ''), ('main.example...', ''), ('main.example', '&sni=main.example..')]:
+            with self.subTest(host=host, sni=sni):
+                target = self.directory / 'outbound.json'
+                if target.exists():
+                    target.unlink()
+                result, outbound = self.parse('vless://' + UUID + '@' + host + ':443?security=tls&flow=xtls-rprx-vision' + sni)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(outbound)
 
     def test_proxy_link_rejects_invalid_or_unsupported_connections(self):
         base = 'vless://' + UUID + '@main.example:443?security=tls&flow=xtls-rprx-vision'

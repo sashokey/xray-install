@@ -15,3 +15,15 @@ wget -qO setup-proxy.sh https://raw.githubusercontent.com/sashokey/xray-install/
 ```
 
 Enter the slave domain, generate or enter a UUID, and paste the main VLESS link. Save the displayed slave link. The script removes SSH and reboots after successful checks.
+
+## Tests
+
+```bash
+bash -n setup.sh setup-proxy.sh
+python3 -m unittest discover -s tests -v
+```
+
+GitHub Actions runs the full suite in Debian 13. Local interactive-input and domain tests require the supported Bash 5 runtime; set `BASH_BIN` to select that interpreter. Other tests can run with macOS Bash 3.2. CI rejects an older Bash runtime instead of skipping those tests.
+
+The suite executes installer functions and the actual Python configuration/link parsers with temporary files and controlled external-command boundaries. It does not install services, change networking, request certificates, remove SSH, or reboot a machine. Complete server provisioning still requires a disposable Debian 13 VM with the documented network prerequisites.
+

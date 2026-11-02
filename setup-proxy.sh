@@ -757,7 +757,7 @@ def hostname(value):
     try:
         return str(ipaddress.ip_address(value))
     except ValueError:
-        labels = value.rstrip('.').lower().split('.')
+        labels = value.removesuffix('.').lower().split('.')
         if len(value) > 253 or len(labels) < 2 or not re.search(r'[a-z]', labels[-1]):
             reject('Invalid main server hostname.')
         if any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels):

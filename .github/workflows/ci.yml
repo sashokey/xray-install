@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: debian:13-slim
+    timeout-minutes: 10
+    steps:
+      - name: Install test runtime
+        run: apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git python3
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check Bash syntax
+        run: bash -n setup.sh setup-proxy.sh
+      - name: Run all installer behavior tests
+        run: python3 -m unittest discover -s tests -v

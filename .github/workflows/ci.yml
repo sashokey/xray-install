@@ -20,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check Bash syntax
-        run: bash -n setup.sh setup-proxy.sh
+        run: bash -n setup.sh && bash -n setup-proxy.sh && bash -n tests/integration.sh
       - name: Run all installer behavior tests
         run: python3 -m unittest discover -s tests -v
 

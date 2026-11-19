@@ -80,6 +80,7 @@ ask_inputs() {
 
 preflight() {
     [[ "$EUID" -eq 0 ]] || fail 'Run this script as root.'
+    [[ "${SSH_CONNECTION:-}" != *:* ]] || fail 'Use IPv4 SSH or the server console; IPv6 will be disabled.'
     [[ -f /etc/os-release ]] || fail 'Cannot identify the operating system.'
     . /etc/os-release
     [[ "$ID" == debian && "$VERSION_ID" == 13 ]] || fail 'Debian 13 is required.'
@@ -106,19 +107,187 @@ lock_setup() {
     TEMP_DIR="$(mktemp -d /tmp/xray-setup.XXXXXXXX)"
 }
 
+prepare_nginx_package() {
+    [[ ! -d /proc/sys/net/ipv6 ]] || return 0
+    local default_site=/etc/nginx/sites-enabled/default
+    if [[ -L "$default_site" ]]; then
+        case "$(readlink "$default_site")" in
+            /etc/nginx/sites-available/default|../sites-available/default) ;;
+            *) return 0 ;;
+        esac
+    elif [[ -e "$default_site" ]]; then
+        return 0
+    fi
+    install -d -m 755 /etc/nginx/sites-enabled
+    ln -sfn /dev/null "$default_site"
+}
+
 install_packages() {
     apt-get -o Acquire::ForceIPv4=true update
+    prepare_nginx_package
     apt-get -o DPkg::Lock::Timeout=-1 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         nginx certbot curl ca-certificates python3 python3-yaml unzip openssl \
         dnsutils kmod cron nftables
+}
+
+publish_netplan() {
+    local staging="$1" destination="$2" path temporary
+    for path in "$staging/"*.yaml; do
+        temporary="$(mktemp "$destination/.xray.XXXXXXXX")" || return
+        if ! install -m 600 "$path" "$temporary" || ! mv -f "$temporary" "$destination/${path##*/}"; then
+            rm -f "$temporary"
+            return 1
+        fi
+    done
+}
+
+wait_for_ipv4_route() {
+    local attempt
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        ip -4 route get 8.8.8.8 >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
 }
 
 configure_network() {
     local backup_dir sysctl_file
     backup_dir="$STATE_DIR/backups/$(date +%Y%m%d-%H%M%S)"
     install -d -m 700 "$backup_dir"
-    cp -a /etc/netplan "$backup_dir/netplan"
+    cp -a /etc/netplan/. "$backup_dir/netplan"
     cp -a /etc/resolv.conf "$backup_dir/resolv.conf"
+    local staging="$TEMP_DIR/netplan-root/etc" layer
+    install -d -m 700 "$staging"
+    cp -aL /etc/netplan "$staging/netplan"
+    for layer in /lib/netplan /run/netplan; do
+        [[ -d "$layer" ]] || continue
+        install -d -m 700 "$TEMP_DIR/netplan-root${layer%/netplan}"
+        cp -aL "$layer" "$TEMP_DIR/netplan-root$layer"
+    done
+    python3 - "$staging/netplan" <<'PY'
+import ipaddress
+from pathlib import Path
+import subprocess
+import sys
+import yaml
+
+resolvers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
+directory = Path(sys.argv[1])
+paths = sorted(directory.glob("*.yaml"))
+sections = ("ethernets", "bonds", "bridges", "vlans", "wifis", "modems",
+            "dummy-devices", "virtual-ethernets", "tunnels", "vrfs")
+ipv6_options = ("gateway6", "ipv6-address-generation", "ipv6-address-token", "ipv6-privacy", "ra-overrides", "dhcp6-overrides")
+if not paths:
+    raise SystemExit("No persistent Netplan YAML configuration found in /etc/netplan.")
+
+def ipv6(value):
+    try:
+        return ipaddress.ip_interface(str(value)).version == 6
+    except ValueError:
+        return False
+
+def ipv6_address(address):
+    return ipv6(next(iter(address)) if isinstance(address, dict) else address)
+
+def ipv6_route(route):
+    return any(ipv6(route.get(key, "")) for key in ("to", "via", "from"))
+
+def section_devices(network, section):
+    definitions = network.get(section, {})
+    if definitions.get("renderer", "networkd") != "networkd":
+        raise SystemExit("Only the networkd renderer is supported.")
+    return (device for name, device in definitions.items() if name != "renderer")
+
+class NetplanLoader(yaml.SafeLoader):
+    yaml_implicit_resolvers = {
+        prefix: [resolver for resolver in resolvers if resolver[0] == "tag:yaml.org,2002:merge"]
+        for prefix, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+    def construct_object(self, node, deep=False):
+        if isinstance(node, yaml.ScalarNode):
+            return node.value
+        return super().construct_object(node, deep=deep)
+
+def enabled(value):
+    return str(value).lower() in ("true", "on", "yes", "y")
+
+def effective_network(root):
+    merged = yaml.load(subprocess.check_output(["netplan", "get", "--root-dir", str(root)], text=True), Loader=NetplanLoader)
+    network = (merged or {}).get("network", {})
+    network.setdefault("renderer", "networkd")
+    return network
+
+changes = []
+for path in paths:
+    data = yaml.load(path.read_text(), Loader=NetplanLoader) or {}
+    network = data.get("network", {})
+    if network.get("renderer", "networkd") != "networkd":
+        raise SystemExit("Only the networkd renderer is supported.")
+    for section in sections:
+        for device in section_devices(network, section):
+            if device.get("renderer", "networkd") != "networkd":
+                raise SystemExit("Only the networkd renderer is supported.")
+            device["dhcp6"] = False
+            device["accept-ra"] = False
+            device["link-local"] = ["ipv4"]
+            for key in ipv6_options:
+                device.pop(key, None)
+            if "addresses" in device:
+                device["addresses"] = [address for address in device["addresses"] if not ipv6_address(address)]
+            if "routes" in device:
+                device["routes"] = [route for route in device["routes"] if not ipv6_route(route)]
+            if "routing-policy" in device:
+                device["routing-policy"] = [rule for rule in device["routing-policy"] if not any(ipv6(rule.get(key, "")) for key in ("to", "from"))]
+            if enabled(device.get("dhcp4")):
+                overrides = device.setdefault("dhcp4-overrides", {})
+                overrides["use-dns"] = False
+                overrides["use-domains"] = False
+            device["nameservers"] = {"addresses": resolvers}
+    changes.append((path, yaml.safe_dump(data, sort_keys=False)))
+for path, text in changes:
+    path.write_text(text)
+    path.chmod(0o600)
+
+root = directory.parent.parent
+if any(path.is_file() for layer in ("lib", "run") for path in (root / layer / "netplan").glob("*.yaml")):
+    effective = effective_network(root)
+    if effective.get("renderer", "networkd") != "networkd":
+        raise SystemExit("An active Netplan layer selects a different renderer.")
+    for section in sections:
+        for device in section_devices(effective, section):
+            if (device.get("renderer", "networkd") != "networkd" or enabled(device.get("dhcp6")) or enabled(device.get("accept-ra"))
+                    or "ipv6" in device.get("link-local", ["ipv6"]) or set(device).intersection(ipv6_options)
+                    or any(ipv6_address(address) for address in device.get("addresses", ()))
+                    or any(ipv6_route(route) for route in device.get("routes", ()))
+                    or any(ipv6_route(rule) for rule in device.get("routing-policy", ()))):
+                raise SystemExit("An active Netplan layer overrides the IPv4-only settings. Original files were not changed.")
+    runtime = root / "run/netplan"
+    if any(path.is_file() for path in runtime.glob("*.yaml")):
+        held = runtime.with_name("netplan-held")
+        runtime.rename(held)
+        try:
+            persistent = effective_network(root)
+        finally:
+            held.rename(runtime)
+        if persistent != effective:
+            raise SystemExit("A runtime Netplan layer changes the network that would be configured after reboot.")
+PY
+    netplan generate --root-dir "$TEMP_DIR/netplan-root" || fail 'Netplan validation failed.'
+    if ! publish_netplan "$staging/netplan" /etc/netplan || ! netplan apply || ! wait_for_ipv4_route; then
+        cp -a "$backup_dir/netplan/." /etc/netplan/ || fail 'Netplan rollback could not restore the files.'
+        netplan apply || fail 'The original Netplan files were restored but could not be applied.'
+        fail 'Netplan could not apply working IPv4 settings; the original configuration was restored.'
+    fi
+    if ! rm -f /etc/resolv.conf ||
+        ! printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf ||
+        ! chmod 644 /etc/resolv.conf || ! getent -s dns ahostsv4 github.com >/dev/null; then
+        local restored=true
+        rm -f /etc/resolv.conf && cp -a "$backup_dir/resolv.conf" /etc/resolv.conf || restored=false
+        cp -a "$backup_dir/netplan/." /etc/netplan/ && netplan apply || restored=false
+        [[ "$restored" == true ]] || fail 'DNS setup and restoration failed; console access is required.'
+        fail 'DNS setup failed; the original configuration was restored.'
+    fi
     install -d -m 755 /etc/cloud/cloud.cfg.d /etc/default/grub.d
     if [[ -f /var/lib/cloud/scripts/per-instance/002_onboot ]] && \
         grep -q 'netplan-ipv6-gw-jammy-nohook.sh' /var/lib/cloud/scripts/per-instance/002_onboot; then
@@ -135,65 +304,10 @@ configure_network() {
     printf 'network:\n  config: disabled\nmanage_resolv_conf: false\n' \
         > /etc/cloud/cloud.cfg.d/99-xray-network.cfg
     chmod 644 /etc/cloud/cloud.cfg.d/99-xray-network.cfg
-    python3 - <<'PY'
-import ipaddress
-from pathlib import Path
-import yaml
-
-resolvers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
-paths = sorted(Path("/etc/netplan").glob("*.yaml"))
-if not paths:
-    raise SystemExit("No Netplan configuration found.")
-
-def ipv6(value):
-    try:
-        return ipaddress.ip_interface(str(value)).version == 6
-    except ValueError:
-        return False
-
-changes = []
-for path in paths:
-    data = yaml.safe_load(path.read_text()) or {}
-    network = data.get("network", {})
-    if network.get("renderer", "networkd") != "networkd":
-        raise SystemExit("Only the networkd renderer is supported.")
-    for section in ("ethernets", "bonds", "bridges", "vlans", "wifis"):
-        for device in network.get(section, {}).values():
-            if device.get("renderer", "networkd") != "networkd":
-                raise SystemExit("Only the networkd renderer is supported.")
-            device["dhcp6"] = False
-            device["accept-ra"] = False
-            device["link-local"] = ["ipv4"]
-            for key in ("gateway6", "ipv6-address-generation", "ipv6-address-token", "ipv6-privacy", "ra-overrides", "dhcp6-overrides"):
-                device.pop(key, None)
-            if "addresses" in device:
-                device["addresses"] = [address for address in device["addresses"] if not ipv6(next(iter(address)) if isinstance(address, dict) else address)]
-            if "routes" in device:
-                device["routes"] = [route for route in device["routes"] if not any(ipv6(route.get(key, "")) for key in ("to", "via", "from"))]
-            if "routing-policy" in device:
-                device["routing-policy"] = [rule for rule in device["routing-policy"] if not any(ipv6(rule.get(key, "")) for key in ("to", "from"))]
-            if device.get("dhcp4"):
-                overrides = device.setdefault("dhcp4-overrides", {})
-                overrides["use-dns"] = False
-                overrides["use-domains"] = False
-            device["nameservers"] = {"addresses": resolvers}
-    changes.append((path, yaml.safe_dump(data, sort_keys=False)))
-for path, text in changes:
-    path.write_text(text)
-    path.chmod(0o600)
-PY
-    if ! netplan generate; then
-        cp -a "$backup_dir/netplan/." /etc/netplan/
-        fail 'Netplan validation failed; the original Netplan files were restored.'
-    fi
-    netplan apply
     if [[ "$(systemctl show systemd-resolved -p LoadState --value)" != not-found ]]; then
         systemctl disable --now systemd-resolved
         systemctl mask systemd-resolved
     fi
-    rm -f /etc/resolv.conf
-    printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf
-    chmod 644 /etc/resolv.conf
     cat > /etc/sysctl.d/99-xray-ipv4.conf <<'EOF'
 -net.ipv6.conf.all.disable_ipv6=1
 -net.ipv6.conf.default.disable_ipv6=1
@@ -214,11 +328,13 @@ EOF
 }
 
 check_domain_dns() {
-    local records
-    records="$(dig +time=1 +tries=1 +noall +answer A "$PROJECT_DOMAIN" | awk '$4 == "A" {print $5}')"
-    [[ -n "$records" ]] || fail "No public A record found for $PROJECT_DOMAIN."
-    records="$(dig +time=1 +tries=1 +noall +answer AAAA "$PROJECT_DOMAIN" | awk '$4 == "AAAA" {print $5}')"
-    [[ -z "$records" ]] || fail 'Remove the domain AAAA record before using this IPv4-only server.'
+    local reply
+    reply="$(dig +time=1 +tries=1 +noall +comments +answer A "$PROJECT_DOMAIN")" || fail 'The A record lookup failed.'
+    [[ "$reply" == *'status: NOERROR,'* ]] || fail 'The A record lookup failed.'
+    [[ -n "$(awk '$4 == "A" {print $5}' <<< "$reply")" ]] || fail "No public A record found for $PROJECT_DOMAIN."
+    reply="$(dig +time=1 +tries=1 +noall +comments +answer AAAA "$PROJECT_DOMAIN")" || fail 'The AAAA record lookup failed.'
+    [[ "$reply" == *'status: NOERROR,'* ]] || fail 'The AAAA record lookup failed.'
+    [[ -z "$(awk '$4 == "AAAA" {print $5}' <<< "$reply")" ]] || fail 'Remove the domain AAAA record before using this IPv4-only server.'
 }
 
 latest_version() {
@@ -369,13 +485,13 @@ update_system() {
 }
 
 configure_updates() {
-    install -d -m 755 /usr/local/sbin
-    install -m 700 "${BASH_SOURCE[0]}" /usr/local/sbin/xray-setup.new
-    mv -f /usr/local/sbin/xray-setup.new /usr/local/sbin/xray-setup
-    printf '%s\n' "$PROJECT_DOMAIN" > "$STATE_DIR/domain"
-    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n@daily root /usr/local/sbin/xray-setup --update 2>&1 | /usr/bin/logger -t xray-update\n' > /etc/cron.d/xray-update
-    chmod 644 /etc/cron.d/xray-update
-    systemctl enable --now cron
+    install -d -m 755 /usr/local/sbin || return
+    install -m 700 "${BASH_SOURCE[0]}" /usr/local/sbin/xray-setup.new || return
+    mv -f /usr/local/sbin/xray-setup.new /usr/local/sbin/xray-setup || return
+    printf '%s\n' "$PROJECT_DOMAIN" > "$STATE_DIR/domain" || return
+    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n@daily root /usr/local/sbin/xray-setup --update 2>&1 | /usr/bin/logger -t xray-update\n' > "$TEMP_DIR/xray-update" || return
+    install -m 644 "$TEMP_DIR/xray-update" /etc/cron.d/.xray-update.new || return
+    mv -fT /etc/cron.d/.xray-update.new /etc/cron.d/xray-update
 }
 
 disable_unused_services() {
@@ -449,12 +565,14 @@ obtain_certificate() {
 }
 
 write_xray_config() {
-    python3 - "$PROJECT_DOMAIN" "$VLESS_CLIENT_UUID" "$TEMP_DIR/config.json" <<'PY'
+    python3 - "$PROJECT_DOMAIN" "$TEMP_DIR/config.json" 3<<< "$VLESS_CLIENT_UUID" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-domain, client_id, target = sys.argv[1:]
+domain, target = sys.argv[1:]
+with open(3, encoding="utf-8") as source:
+    client_id = source.read().strip()
 config = {
     "log": {"loglevel": "none"},
     "inbounds": [{
@@ -529,7 +647,8 @@ configure_bbr() {
     sysctl -p /etc/sysctl.d/99-bbr.conf
 }
 
-configure_firewall() {
+configure_firewall_and_updates() {
+    local was_active=false was_enabled=false rollback_failed=false
     cat > "$TEMP_DIR/nftables.conf" <<'EOF'
 flush ruleset
 table inet xray {
@@ -553,19 +672,45 @@ table inet xray {
 }
 EOF
     nft --check --file "$TEMP_DIR/nftables.conf"
-    install -m 600 "$TEMP_DIR/nftables.conf" /etc/nftables.conf
-    nft --file /etc/nftables.conf
-    systemctl enable --now nftables
+    systemctl is-active --quiet nftables && was_active=true
+    systemctl is-enabled --quiet nftables && was_enabled=true
+    if [[ -e /etc/nftables.conf || -L /etc/nftables.conf ]]; then
+        cp -a /etc/nftables.conf "$TEMP_DIR/nftables.conf.before"
+    fi
+    { printf 'flush ruleset\n'; nft list ruleset; } > "$TEMP_DIR/nftables.rules.before"
+    if install -m 600 "$TEMP_DIR/nftables.conf" /etc/nftables.conf &&
+        nft --file /etc/nftables.conf && systemctl enable --now nftables && verify_firewall && configure_updates; then
+        return 0
+    fi
+    if [[ -e "$TEMP_DIR/nftables.conf.before" || -L "$TEMP_DIR/nftables.conf.before" ]]; then
+        cp -a "$TEMP_DIR/nftables.conf.before" /etc/nftables.conf || rollback_failed=true
+    else
+        rm -f /etc/nftables.conf || rollback_failed=true
+    fi
+    if [[ "$was_active" == false ]]; then
+        systemctl stop nftables || rollback_failed=true
+    fi
+    if [[ "$was_enabled" == false ]]; then
+        systemctl disable nftables || rollback_failed=true
+    fi
+    nft --file "$TEMP_DIR/nftables.rules.before" || rollback_failed=true
+    [[ "$rollback_failed" == false ]] || fail 'Firewall setup and rollback failed; console access is required.'
+    fail 'Firewall or update setup failed; the previous firewall was restored.'
+}
+
+verify_firewall() {
+    systemctl is-active --quiet nftables || return
+    systemctl is-enabled --quiet nftables || return
+    nft list chain inet xray input | grep -F 'policy drop;' >/dev/null || return
+    nft list chain inet xray forward | grep -F 'policy drop;' >/dev/null
 }
 
 verify_installation() {
     local service
-    for service in nginx xray certbot.timer cron nftables; do
+    for service in nginx xray certbot.timer cron; do
         systemctl is-active --quiet "$service" || fail "Required service is inactive: $service"
         systemctl is-enabled --quiet "$service" || fail "Required service is disabled: $service"
     done
-    nft list chain inet xray input | grep -F 'policy drop;' >/dev/null
-    nft list chain inet xray forward | grep -F 'policy drop;' >/dev/null
     [[ -z "$(ip -6 -o address show)" ]] || fail 'IPv6 addresses are still present.'
     [[ "$(awk '/^nameserver / {print $2}' /etc/resolv.conf)" == $'8.8.8.8\n8.8.4.4\n1.1.1.1' ]] || fail 'Unexpected DNS servers.'
     [[ ! -L /etc/resolv.conf ]] || fail 'resolv.conf must be a static file.'
@@ -629,14 +774,14 @@ main() {
     obtain_certificate
     step 'Writing and starting the Xray configuration'
     write_xray_config
-    configure_updates
     step 'Disabling unused services'
     disable_unused_services
-    step 'Allowing inbound HTTP and HTTPS only'
-    configure_firewall
+    systemctl enable --now cron
     step 'Verifying the installation before removing SSH'
     verify_installation
     print_client
+    step 'Allowing inbound HTTP and HTTPS only'
+    configure_firewall_and_updates
     remove_ssh_and_reboot
 }
 

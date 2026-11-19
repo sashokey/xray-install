@@ -89,6 +89,7 @@ ask_inputs() {
 
 preflight() {
     [[ "$EUID" -eq 0 ]] || fail 'Run this script as root.'
+    [[ "${SSH_CONNECTION:-}" != *:* ]] || fail 'Use IPv4 SSH or the server console; IPv6 will be disabled.'
     [[ -f /etc/os-release ]] || fail 'Cannot identify the operating system.'
     . /etc/os-release
     [[ "$ID" == debian && "$VERSION_ID" == 13 ]] || fail 'Debian 13 is required.'
@@ -121,12 +122,28 @@ lock_setup() {
     TEMP_DIR="$(mktemp -d /tmp/xray-setup.XXXXXXXX)"
 }
 
+prepare_nginx_package() {
+    [[ ! -d /proc/sys/net/ipv6 ]] || return 0
+    local default_site=/etc/nginx/sites-enabled/default
+    if [[ -L "$default_site" ]]; then
+        case "$(readlink "$default_site")" in
+            /etc/nginx/sites-available/default|../sites-available/default) ;;
+            *) return 0 ;;
+        esac
+    elif [[ -e "$default_site" ]]; then
+        return 0
+    fi
+    install -d -m 755 /etc/nginx/sites-enabled
+    ln -sfn /dev/null "$default_site"
+}
+
 install_packages() {
     local -a packages=(nginx certbot curl ca-certificates python3 unzip openssl dnsutils kmod cron nftables)
     if [[ "$NETWORK_BACKEND" == netplan ]]; then
         packages+=(python3-yaml)
     fi
     apt-get -o Acquire::ForceIPv4=true update
+    prepare_nginx_package
     apt-get -o DPkg::Lock::Timeout=-1 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         "${packages[@]}"
 }
@@ -142,7 +159,10 @@ remove_unused_packages() {
         xauth xdg-user-dirs wget haveged
     )
     if [[ "$NETWORK_BACKEND" == ifupdown ]]; then
-        candidates+=(dhcpcd-base python3-yaml)
+        candidates+=(dhcpcd-base)
+        if [[ "$(dpkg-query -W -f='${db:Status-Status}' cloud-init 2>/dev/null || true)" != installed ]]; then
+            candidates+=(python3-yaml)
+        fi
     fi
     for package in "${candidates[@]}"; do
         if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" == installed ]]; then
@@ -152,8 +172,8 @@ remove_unused_packages() {
     [[ ${#selected[@]} -gt 0 ]] || return 0
     LC_ALL=C apt-get -s --auto-remove purge -- "${selected[@]}" > "$TEMP_DIR/cleanup-plan"
     while read -r package; do
-        case "$package" in
-            apt|dpkg|bash|coreutils|systemd*|udev|dbus*|linux-*|grub*|initramfs-*|ifupdown|netplan.io|iproute2|openssh-*|qemu-guest-agent|console-setup*|keyboard-configuration|nano|nginx*|certbot|python3|python3-minimal|curl|ca-certificates|unzip|openssl|dnsutils|bind9-dnsutils|kmod|cron*|nftables)
+        case "${package%%:*}" in
+            apt|dpkg|bash|coreutils|systemd*|udev|dbus*|linux-*|grub*|initramfs-*|ifupdown|netplan.io|iproute2|openssh-*|cloud-init|qemu-guest-agent|console-setup*|keyboard-configuration|nano|nginx*|certbot|python3|python3-minimal|curl|ca-certificates|unzip|openssl|dnsutils|bind9-dnsutils|kmod|cron*|nftables)
                 fail "Package cleanup would remove a required component: $package"
                 ;;
         esac
@@ -167,68 +187,189 @@ remove_unused_packages() {
 }
 
 configure_ifupdown() {
-    python3 - /etc/network/interfaces "$TEMP_DIR/ifupdown.validation" <<'PY'
+    python3 - /etc/network/interfaces "$TEMP_DIR/ifupdown-check" <<'PY'
+import ctypes
 import glob
+import os
 import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-root = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[1]).absolute()
+network_directory = root.parent.resolve()
 validation = Path(sys.argv[2])
+libc = ctypes.CDLL(None)
+libc.fnmatch.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
 contents = {}
-pending = [root]
+includes = {}
+families = {}
+interfaces = {}
+templates = {}
+mapping_patterns = []
+renames = []
+
+def logical_lines(text):
+    parts = []
+    for line in text.splitlines(keepends=True):
+        if not parts and line.lstrip().startswith('#'):
+            yield line
+            continue
+        parts.append(line)
+        if not line.endswith('\\\n'):
+            yield ''.join(parts)
+            parts.clear()
+    if parts:
+        yield ''.join(parts)
+
+def logical_text(line):
+    return line.replace('\\\n', '').strip()
+
+def source_directive(word):
+    return word == 'source' or word.startswith('source-dir')
 
 def words(line):
-    text = line.strip()
+    text = logical_text(line)
     if not text or text.startswith('#'):
         return []
-    first = text.split(None, 1)[0]
-    if first in ('source', 'source-directory', 'iface', 'auto', 'mapping') or first.startswith('allow-'):
-        return shlex.split(text, comments=True)
-    return [first]
+    return text.split()
 
-while pending:
-    path = pending.pop(0).resolve()
+def implicit_iface_directive(tokens):
+    return len(tokens) == 1 and (
+        tokens[0] in ('auto', 'no-auto-down', 'no-scripts') or tokens[0].startswith('allow-')
+    )
+
+def expand_words(pattern):
+    if sys.platform != 'linux':
+        return [match for word in shlex.split(pattern) for match in sorted(glob.glob(word))]
+
+    class WordExpansion(ctypes.Structure):
+        _fields_ = [('count', ctypes.c_size_t), ('words', ctypes.POINTER(ctypes.c_char_p)), ('offset', ctypes.c_size_t)]
+
+    libc.wordexp.argtypes = [ctypes.c_char_p, ctypes.POINTER(WordExpansion), ctypes.c_int]
+    libc.wordfree.argtypes = [ctypes.POINTER(WordExpansion)]
+    libc.wordfree.restype = None
+    no_command_substitution = 4
+    expansion = WordExpansion()
+    if libc.wordexp(os.fsencode(pattern), ctypes.byref(expansion), no_command_substitution):
+        raise SystemExit('ERROR: Invalid ifupdown include path.')
+    try:
+        return [os.fsdecode(expansion.words[index]) for index in range(expansion.count)]
+    finally:
+        libc.wordfree(ctypes.byref(expansion))
+
+def include_files(path, line):
+    directive, *arguments = logical_text(line).split(None, 1)
+    if not arguments:
+        return []
+    pattern = arguments[0]
+    if not pattern.startswith('/'):
+        pattern = f'{path.parent}/{pattern}'
+    files = []
+    for match in expand_words(pattern):
+        entry = Path(match).absolute()
+        if directive == 'source' and entry.is_file():
+            files.append(entry)
+        elif directive != 'source' and entry.is_dir():
+            files.extend(
+                child for child in sorted(entry.iterdir())
+                if child.is_file() and re.fullmatch(r'[A-Za-z0-9_-]+', child.name)
+            )
+    return files
+
+def read_interfaces(path, ancestors):
     if path in contents:
-        continue
-    if not path.is_relative_to(root.parent):
+        return
+    physical = path.resolve()
+    if not physical.is_relative_to(network_directory):
         raise SystemExit('ERROR: ifupdown include files must stay inside /etc/network.')
+    if physical in ancestors:
+        raise SystemExit('ERROR: Recursive ifupdown include.')
     text = path.read_text(encoding='utf-8')
     contents[path] = text
-    for line in text.splitlines():
+    for line in logical_lines(text):
         tokens = words(line)
-        if not tokens or tokens[0] not in ('source', 'source-directory'):
+        if not tokens:
             continue
-        for pattern in tokens[1:]:
-            pattern = str(path.parent / pattern) if not Path(pattern).is_absolute() else pattern
-            for match in sorted(glob.glob(pattern)):
-                entry = Path(match)
-                if tokens[0] == 'source-directory' and entry.is_dir():
-                    pending.extend(child for child in sorted(entry.iterdir()) if child.is_file() and re.fullmatch(r'[A-Za-z0-9_-]+', child.name))
-                elif tokens[0] == 'source' and entry.is_file():
-                    pending.append(entry)
-
-families = {}
-for text in contents.values():
-    for line in text.splitlines():
-        tokens = words(line)
-        if tokens and tokens[0] == 'iface':
+        if source_directive(tokens[0]):
+            includes[path, line] = include_files(path, line)
+            for entry in includes[path, line]:
+                read_interfaces(entry, ancestors | {physical})
+        elif tokens[0] == 'mapping':
+            mapping_patterns.extend(tokens[1:])
+        elif tokens[0] == 'rename':
+            for rule in tokens[1:]:
+                old_name, separator, new_name = rule.partition('=')
+                if separator:
+                    renames.append((old_name, new_name))
+        elif tokens[0] == 'iface':
             if len(tokens) < 4:
                 raise SystemExit('ERROR: Invalid ifupdown interface definition.')
-            families.setdefault(tokens[1], set()).add(tokens[2])
-            if tokens[2] == 'inet' and tokens[3] not in ('static', 'manual', 'loopback'):
+            name = tokens[1]
+            settings = tokens[2:]
+            if 'inherits' in settings:
+                marker = settings.index('inherits')
+                inherited = settings[marker + 1:]
+                if len(inherited) != 1 or marker > 2:
+                    raise SystemExit('ERROR: Invalid ifupdown interface template.')
+                template = templates.get((inherited[0], settings[0] if marker else None))
+                if template is None:
+                    raise SystemExit('ERROR: Invalid ifupdown interface template.')
+                settings = settings[:marker] + list(template[marker:])
+            family, method = settings[:2]
+            interfaces[path, line] = family, method
+            templates.setdefault((name, None), (family, method))
+            templates.setdefault((name, family), (family, method))
+            families.setdefault(name, set()).add(family)
+            if family == 'inet' and method not in ('static', 'manual', 'loopback'):
                 raise SystemExit('ERROR: This ifupdown image must use static IPv4; DHCP configurations require the Netplan backend.')
+
+read_interfaces(root, set())
 ipv6_only = {name for name, values in families.items() if values == {'inet6'}}
 changes = {}
-flattened = []
+
+def matches(pattern, name, flags=0):
+    return libc.fnmatch(os.fsencode(pattern), os.fsencode(name), flags) == 0
+
+def name_pattern(value):
+    return value.startswith('/') and '/' not in value[1:]
+
+def renamed_name(physical):
+    extended_matching = 1 << 5 if sys.platform == 'linux' else 0
+    for source, target in renames:
+        if target == physical:
+            continue
+        if physical == source or (name_pattern(source) and matches(source[1:], physical, extended_matching)):
+            return target
+    return physical
+
+def logical_name(selection):
+    physical, separator, alias = selection.partition('=')
+    return alias if separator else renamed_name(physical)
+
+def ipv4_selections(selections, selection_class):
+    for selection in selections:
+        physical, separator, _ = selection.partition('=')
+        if logical_name(selection) not in ipv6_only:
+            yield selection
+        elif not separator and any('/' in source and not name_pattern(source) for source, _ in renames):
+            raise SystemExit('ERROR: Cannot safely remove an IPv6-only selection with a complex ifupdown rename.')
+        elif selection_class == 'allow-hotplug':
+            if separator and '/' in physical:
+                raise SystemExit('ERROR: Cannot safely remove an IPv6-only alias from an ifupdown hotplug pattern.')
+            if separator and 'inet' in families.get(renamed_name(physical), ()):
+                yield physical
 
 for path, text in contents.items():
     blocks = []
-    for line in text.splitlines(keepends=True):
+    for line in logical_lines(text):
         tokens = words(line)
-        begins = tokens and (tokens[0] in ('iface', 'source', 'source-directory', 'mapping', 'auto') or tokens[0].startswith('allow-'))
+        begins = tokens and (tokens[0] in (
+            'iface', 'mapping', 'auto', 'rename', 'no-auto-down', 'no-scripts',
+        ) or tokens[0].startswith('allow-') or source_directive(tokens[0]))
+        if implicit_iface_directive(tokens) and blocks and words(blocks[-1][0])[:1] == ['iface']:
+            begins = False
         if begins or not blocks:
             blocks.append([])
         blocks[-1].append(line)
@@ -236,33 +377,111 @@ for path, text in contents.items():
     for block in blocks:
         tokens = words(block[0])
         if tokens and tokens[0] == 'iface':
-            if tokens[2] == 'inet6':
+            family, method = interfaces[path, block[0]]
+            if family == 'inet6':
+                for line in block[1:]:
+                    directive = words(line)
+                    if implicit_iface_directive(directive):
+                        for name in ipv4_selections([tokens[1]], directive[0]):
+                            rewritten.append(f'{directive[0]} {name}\n')
                 continue
-            if tokens[2] == 'inet' and tokens[3] != 'loopback':
-                block = [line for line in block if not re.match(r'^\s*dns-(?:nameservers|search|domain)\s', line)]
+            if family == 'inet' and method != 'loopback':
+                block = [
+                    line for line in block
+                    if words(line)[:1] not in (['dns-nameservers'], ['dns-search'], ['dns-domain'])
+                ]
                 while block and not block[-1].strip():
                     block.pop()
                 block[-1] = block[-1].rstrip('\n') + '\n'
                 block.append('    dns-nameservers 8.8.8.8 8.8.4.4 1.1.1.1\n\n')
         elif tokens and (tokens[0] == 'auto' or tokens[0].startswith('allow-')):
-            names = [name for name in tokens[1:] if name not in ipv6_only]
+            names = list(ipv4_selections(tokens[1:], tokens[0]))
             if names != tokens[1:]:
                 block = ([tokens[0] + ' ' + ' '.join(names) + '\n'] if names else []) + block[1:]
         rewritten.extend(block)
-        if tokens and tokens[0] in ('source', 'source-directory'):
-            flattened.extend(block[1:])
-        else:
-            flattened.extend(block)
     changes[path] = ''.join(rewritten)
 
-validation.write_text(''.join(flattened), encoding='utf-8')
-check = subprocess.run(['ifquery', '--interfaces', str(validation), '--list'], text=True, capture_output=True)
-if check.returncode:
-    raise SystemExit('ERROR: ifquery rejected the configuration; original interface files were not changed.')
-for path, text in changes.items():
-    if text != contents[path]:
-        path.write_text(text, encoding='utf-8')
+def query_selections(command):
+    check = subprocess.run(command, text=True, capture_output=True)
+    if check.returncode or check.stderr.strip():
+        raise SystemExit('ERROR: ifquery rejected the configuration; original interface files were not changed.')
+    return set(check.stdout.splitlines())
+
+def select_staged_interfaces(texts, directory):
+    staged_paths = {path: directory / str(index) / path.name for index, path in enumerate(texts)}
+    selections_by_class = {'auto': []}
+    selected_names = set()
+    for path, text in texts.items():
+        target = staged_paths[path]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for line in logical_lines(text):
+            tokens = words(line)
+            if tokens and source_directive(tokens[0]):
+                for entry in includes[path, line]:
+                    included = str(staged_paths[entry])
+                    lines.append(f'source /{shlex.quote(included[1:])}\n')
+            else:
+                lines.append(line)
+                if not tokens:
+                    continue
+                if tokens[0] == 'auto' or tokens[0].startswith('allow-'):
+                    selection_class = tokens[0].removeprefix('allow-')
+                    selections_by_class.setdefault(selection_class, []).extend(tokens[1:])
+        target.write_text(''.join(lines), encoding='utf-8')
+
+    staged_root = staged_paths[root]
+    command = ['ifquery', '--interfaces', str(staged_root), '--list']
+    for selection_class, selections in sorted(selections_by_class.items()):
+        options = [] if selection_class == 'auto' else [f'--allow={selection_class}']
+        physical_names = query_selections(command + options)
+        if not (ipv6_only and mapping_patterns):
+            continue
+        if selection_class == 'hotplug':
+            selected_names.update(physical_names)
+        explained = set()
+        for selection in selections:
+            match = query_selections(command + ['--', selection]) & physical_names
+            if match:
+                explained.update(match)
+                _, separator, alias = selection.partition('=')
+                selected_names.update({alias} if separator else match)
+        selected_names.update(physical_names - explained)
+    return selected_names
+
+selected_names = select_staged_interfaces(changes, validation / 'candidate')
+if ipv6_only and mapping_patterns:
+    selected_names.update(select_staged_interfaces(contents, validation / 'original'))
+    if any(matches(pattern, name) for pattern in mapping_patterns for name in selected_names):
+        raise SystemExit('ERROR: Cannot safely remove IPv6-only interfaces selected through an ifupdown mapping.')
+try:
+    for path, text in changes.items():
+        if text != contents[path]:
+            path.write_text(text, encoding='utf-8')
+except OSError as error:
+    print(f'ERROR: Could not write ifupdown configuration: {error}', file=sys.stderr)
+    raise SystemExit(2)
 PY
+}
+
+publish_netplan() {
+    local staging="$1" destination="$2" path temporary
+    for path in "$staging/"*.yaml; do
+        temporary="$(mktemp "$destination/.xray.XXXXXXXX")" || return
+        if ! install -m 600 "$path" "$temporary" || ! mv -f "$temporary" "$destination/${path##*/}"; then
+            rm -f "$temporary"
+            return 1
+        fi
+    done
+}
+
+wait_for_ipv4_route() {
+    local attempt
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        ip -4 route get 8.8.8.8 >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
 }
 
 configure_network() {
@@ -270,11 +489,157 @@ configure_network() {
     backup_dir="$STATE_DIR/backups/$(date +%Y%m%d-%H%M%S)"
     install -d -m 700 "$backup_dir"
     if [[ "$NETWORK_BACKEND" == netplan ]]; then
-        cp -a /etc/netplan "$backup_dir/netplan"
+        cp -a /etc/netplan/. "$backup_dir/netplan"
     else
-        cp -a /etc/network "$backup_dir/network"
+        cp -a /etc/network/. "$backup_dir/network"
     fi
     cp -a /etc/resolv.conf "$backup_dir/resolv.conf"
+    if [[ "$NETWORK_BACKEND" == netplan ]]; then
+    local staging="$TEMP_DIR/netplan-root/etc" layer
+    install -d -m 700 "$staging"
+    cp -aL /etc/netplan "$staging/netplan"
+    for layer in /lib/netplan /run/netplan; do
+        [[ -d "$layer" ]] || continue
+        install -d -m 700 "$TEMP_DIR/netplan-root${layer%/netplan}"
+        cp -aL "$layer" "$TEMP_DIR/netplan-root$layer"
+    done
+    python3 - "$staging/netplan" <<'PY'
+import ipaddress
+from pathlib import Path
+import subprocess
+import sys
+import yaml
+
+resolvers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
+directory = Path(sys.argv[1])
+paths = sorted(directory.glob("*.yaml"))
+sections = ("ethernets", "bonds", "bridges", "vlans", "wifis", "modems",
+            "dummy-devices", "virtual-ethernets", "tunnels", "vrfs")
+ipv6_options = ("gateway6", "ipv6-address-generation", "ipv6-address-token", "ipv6-privacy", "ra-overrides", "dhcp6-overrides")
+if not paths:
+    raise SystemExit("No persistent Netplan YAML configuration found in /etc/netplan.")
+
+def ipv6(value):
+    try:
+        return ipaddress.ip_interface(str(value)).version == 6
+    except ValueError:
+        return False
+
+def ipv6_address(address):
+    return ipv6(next(iter(address)) if isinstance(address, dict) else address)
+
+def ipv6_route(route):
+    return any(ipv6(route.get(key, "")) for key in ("to", "via", "from"))
+
+def section_devices(network, section):
+    definitions = network.get(section, {})
+    if definitions.get("renderer", "networkd") != "networkd":
+        raise SystemExit("Only the networkd renderer is supported.")
+    return (device for name, device in definitions.items() if name != "renderer")
+
+class NetplanLoader(yaml.SafeLoader):
+    yaml_implicit_resolvers = {
+        prefix: [resolver for resolver in resolvers if resolver[0] == "tag:yaml.org,2002:merge"]
+        for prefix, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+    def construct_object(self, node, deep=False):
+        if isinstance(node, yaml.ScalarNode):
+            return node.value
+        return super().construct_object(node, deep=deep)
+
+def enabled(value):
+    return str(value).lower() in ("true", "on", "yes", "y")
+
+def effective_network(root):
+    merged = yaml.load(subprocess.check_output(["netplan", "get", "--root-dir", str(root)], text=True), Loader=NetplanLoader)
+    network = (merged or {}).get("network", {})
+    network.setdefault("renderer", "networkd")
+    return network
+
+changes = []
+for path in paths:
+    data = yaml.load(path.read_text(), Loader=NetplanLoader) or {}
+    network = data.get("network", {})
+    if network.get("renderer", "networkd") != "networkd":
+        raise SystemExit("Only the networkd renderer is supported.")
+    for section in sections:
+        for device in section_devices(network, section):
+            if device.get("renderer", "networkd") != "networkd":
+                raise SystemExit("Only the networkd renderer is supported.")
+            device["dhcp6"] = False
+            device["accept-ra"] = False
+            device["link-local"] = ["ipv4"]
+            for key in ipv6_options:
+                device.pop(key, None)
+            if "addresses" in device:
+                device["addresses"] = [address for address in device["addresses"] if not ipv6_address(address)]
+            if "routes" in device:
+                device["routes"] = [route for route in device["routes"] if not ipv6_route(route)]
+            if "routing-policy" in device:
+                device["routing-policy"] = [rule for rule in device["routing-policy"] if not any(ipv6(rule.get(key, "")) for key in ("to", "from"))]
+            if enabled(device.get("dhcp4")):
+                overrides = device.setdefault("dhcp4-overrides", {})
+                overrides["use-dns"] = False
+                overrides["use-domains"] = False
+            device["nameservers"] = {"addresses": resolvers}
+    changes.append((path, yaml.safe_dump(data, sort_keys=False)))
+for path, text in changes:
+    path.write_text(text)
+    path.chmod(0o600)
+
+root = directory.parent.parent
+if any(path.is_file() for layer in ("lib", "run") for path in (root / layer / "netplan").glob("*.yaml")):
+    effective = effective_network(root)
+    if effective.get("renderer", "networkd") != "networkd":
+        raise SystemExit("An active Netplan layer selects a different renderer.")
+    for section in sections:
+        for device in section_devices(effective, section):
+            if (device.get("renderer", "networkd") != "networkd" or enabled(device.get("dhcp6")) or enabled(device.get("accept-ra"))
+                    or "ipv6" in device.get("link-local", ["ipv6"]) or set(device).intersection(ipv6_options)
+                    or any(ipv6_address(address) for address in device.get("addresses", ()))
+                    or any(ipv6_route(route) for route in device.get("routes", ()))
+                    or any(ipv6_route(rule) for rule in device.get("routing-policy", ()))):
+                raise SystemExit("An active Netplan layer overrides the IPv4-only settings. Original files were not changed.")
+    runtime = root / "run/netplan"
+    if any(path.is_file() for path in runtime.glob("*.yaml")):
+        held = runtime.with_name("netplan-held")
+        runtime.rename(held)
+        try:
+            persistent = effective_network(root)
+        finally:
+            held.rename(runtime)
+        if persistent != effective:
+            raise SystemExit("A runtime Netplan layer changes the network that would be configured after reboot.")
+PY
+    netplan generate --root-dir "$TEMP_DIR/netplan-root" || fail 'Netplan validation failed.'
+    if ! publish_netplan "$staging/netplan" /etc/netplan || ! netplan apply || ! wait_for_ipv4_route; then
+        cp -a "$backup_dir/netplan/." /etc/netplan/ || fail 'Netplan rollback could not restore the files.'
+        netplan apply || fail 'The original Netplan files were restored but could not be applied.'
+        fail 'Netplan could not apply working IPv4 settings; the original configuration was restored.'
+    fi
+    else
+        configure_ifupdown || {
+            if [[ "$?" == 2 ]]; then
+                cp -a "$backup_dir/network/." /etc/network/ || fail 'Ifupdown rollback could not restore the files.'
+                fail 'Ifupdown setup failed; the original configuration was restored.'
+            fi
+            fail 'Ifupdown setup failed.'
+        }
+    fi
+    if ! rm -f /etc/resolv.conf ||
+        ! printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf ||
+        ! chmod 644 /etc/resolv.conf || ! getent -s dns ahostsv4 github.com >/dev/null; then
+        local restored=true
+        rm -f /etc/resolv.conf && cp -a "$backup_dir/resolv.conf" /etc/resolv.conf || restored=false
+        if [[ "$NETWORK_BACKEND" == netplan ]]; then
+            cp -a "$backup_dir/netplan/." /etc/netplan/ && netplan apply || restored=false
+        else
+            cp -a "$backup_dir/network/." /etc/network/ || restored=false
+        fi
+        [[ "$restored" == true ]] || fail 'DNS setup and restoration failed; console access is required.'
+        fail 'DNS setup failed; the original configuration was restored.'
+    fi
     install -d -m 755 /etc/cloud/cloud.cfg.d /etc/default/grub.d
     if [[ -f /var/lib/cloud/scripts/per-instance/002_onboot ]] && \
         grep -q 'netplan-ipv6-gw-jammy-nohook.sh' /var/lib/cloud/scripts/per-instance/002_onboot; then
@@ -291,69 +656,10 @@ configure_network() {
     printf 'network:\n  config: disabled\nmanage_resolv_conf: false\n' \
         > /etc/cloud/cloud.cfg.d/99-xray-network.cfg
     chmod 644 /etc/cloud/cloud.cfg.d/99-xray-network.cfg
-    if [[ "$NETWORK_BACKEND" == netplan ]]; then
-    python3 - <<'PY'
-import ipaddress
-from pathlib import Path
-import yaml
-
-resolvers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
-paths = sorted(Path("/etc/netplan").glob("*.yaml"))
-if not paths:
-    raise SystemExit("No Netplan configuration found.")
-
-def ipv6(value):
-    try:
-        return ipaddress.ip_interface(str(value)).version == 6
-    except ValueError:
-        return False
-
-changes = []
-for path in paths:
-    data = yaml.safe_load(path.read_text()) or {}
-    network = data.get("network", {})
-    if network.get("renderer", "networkd") != "networkd":
-        raise SystemExit("Only the networkd renderer is supported.")
-    for section in ("ethernets", "bonds", "bridges", "vlans", "wifis"):
-        for device in network.get(section, {}).values():
-            if device.get("renderer", "networkd") != "networkd":
-                raise SystemExit("Only the networkd renderer is supported.")
-            device["dhcp6"] = False
-            device["accept-ra"] = False
-            device["link-local"] = ["ipv4"]
-            for key in ("gateway6", "ipv6-address-generation", "ipv6-address-token", "ipv6-privacy", "ra-overrides", "dhcp6-overrides"):
-                device.pop(key, None)
-            if "addresses" in device:
-                device["addresses"] = [address for address in device["addresses"] if not ipv6(next(iter(address)) if isinstance(address, dict) else address)]
-            if "routes" in device:
-                device["routes"] = [route for route in device["routes"] if not any(ipv6(route.get(key, "")) for key in ("to", "via", "from"))]
-            if "routing-policy" in device:
-                device["routing-policy"] = [rule for rule in device["routing-policy"] if not any(ipv6(rule.get(key, "")) for key in ("to", "from"))]
-            if device.get("dhcp4"):
-                overrides = device.setdefault("dhcp4-overrides", {})
-                overrides["use-dns"] = False
-                overrides["use-domains"] = False
-            device["nameservers"] = {"addresses": resolvers}
-    changes.append((path, yaml.safe_dump(data, sort_keys=False)))
-for path, text in changes:
-    path.write_text(text)
-    path.chmod(0o600)
-PY
-    if ! netplan generate; then
-        cp -a "$backup_dir/netplan/." /etc/netplan/
-        fail 'Netplan validation failed; the original Netplan files were restored.'
-    fi
-    netplan apply
-    else
-        configure_ifupdown
-    fi
     if [[ "$(systemctl show systemd-resolved -p LoadState --value)" != not-found ]]; then
         systemctl disable --now systemd-resolved
         systemctl mask systemd-resolved
     fi
-    rm -f /etc/resolv.conf
-    printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf
-    chmod 644 /etc/resolv.conf
     cat > /etc/sysctl.d/99-xray-ipv4.conf <<'EOF'
 -net.ipv6.conf.all.disable_ipv6=1
 -net.ipv6.conf.default.disable_ipv6=1
@@ -374,11 +680,13 @@ EOF
 }
 
 check_domain_dns() {
-    local records
-    records="$(dig +time=1 +tries=1 +noall +answer A "$PROJECT_DOMAIN" | awk '$4 == "A" {print $5}')"
-    [[ -n "$records" ]] || fail "No public A record found for $PROJECT_DOMAIN."
-    records="$(dig +time=1 +tries=1 +noall +answer AAAA "$PROJECT_DOMAIN" | awk '$4 == "AAAA" {print $5}')"
-    [[ -z "$records" ]] || fail 'Remove the domain AAAA record before using this IPv4-only server.'
+    local reply
+    reply="$(dig +time=1 +tries=1 +noall +comments +answer A "$PROJECT_DOMAIN")" || fail 'The A record lookup failed.'
+    [[ "$reply" == *'status: NOERROR,'* ]] || fail 'The A record lookup failed.'
+    [[ -n "$(awk '$4 == "A" {print $5}' <<< "$reply")" ]] || fail "No public A record found for $PROJECT_DOMAIN."
+    reply="$(dig +time=1 +tries=1 +noall +comments +answer AAAA "$PROJECT_DOMAIN")" || fail 'The AAAA record lookup failed.'
+    [[ "$reply" == *'status: NOERROR,'* ]] || fail 'The AAAA record lookup failed.'
+    [[ -z "$(awk '$4 == "AAAA" {print $5}' <<< "$reply")" ]] || fail 'Remove the domain AAAA record before using this IPv4-only server.'
 }
 
 latest_version() {
@@ -425,8 +733,6 @@ switch_release() {
 }
 
 install_xray() {
-    latest_version
-    download_xray
     switch_release "$RELEASE_ROOT/releases/$XRAY_VERSION"
     install -d -m 755 /usr/local/bin /usr/local/share /usr/local/etc/xray
     ln -sfnT "$RELEASE_ROOT/current/xray" /usr/local/bin/xray
@@ -460,6 +766,7 @@ restart_xray_checked() {
 
 update_xray() {
     local installed previous candidate
+    local reject_release=false
     [[ -f "$STATE_DIR/domain" ]] || fail 'No installed domain found.'
     PROJECT_DOMAIN="$(cat "$STATE_DIR/domain")"
     validate_domain "$PROJECT_DOMAIN" || fail 'Invalid installed domain.'
@@ -483,16 +790,21 @@ update_xray() {
         fail 'The new release rejected the configuration; the running service was not changed.'
     fi
     switch_release "$candidate"
-    if restart_xray_checked && verify_chain; then
+    if ! restart_xray_checked; then
+        reject_release=true
+    elif verify_chain; then
         rm -f "$STATE_DIR/rejected-version"
         printf 'Xray updated from %s to %s.\n' "$installed" "$XRAY_VERSION"
         touch "$TEMP_DIR/reboot-required"
-    else
-        switch_release "$previous"
-        printf '%s\n' "$XRAY_VERSION" > "$STATE_DIR/rejected-version"
-        restart_xray_checked || fail 'Update and rollback failed; console access is required.'
-        fail "Xray $XRAY_VERSION failed its health check; restored $installed."
+        return
     fi
+    switch_release "$previous"
+    restart_xray_checked || fail 'Update and rollback failed; console access is required.'
+    if [[ "$reject_release" == true ]]; then
+        printf '%s\n' "$XRAY_VERSION" > "$STATE_DIR/rejected-version"
+    fi
+    verify_chain || fail "Xray $installed was restored, but the proxy chain is still unhealthy."
+    fail "Xray $XRAY_VERSION failed its health check; restored $installed."
 }
 
 upgrade_packages() {
@@ -530,13 +842,13 @@ update_system() {
 }
 
 configure_updates() {
-    install -d -m 755 /usr/local/sbin
-    install -m 700 "${BASH_SOURCE[0]}" /usr/local/sbin/xray-proxy-setup.new
-    mv -f /usr/local/sbin/xray-proxy-setup.new /usr/local/sbin/xray-proxy-setup
-    printf '%s\n' "$PROJECT_DOMAIN" > "$STATE_DIR/domain"
-    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n@daily root /usr/local/sbin/xray-proxy-setup --update 2>&1 | /usr/bin/logger -t xray-update\n' > /etc/cron.d/xray-update
-    chmod 644 /etc/cron.d/xray-update
-    systemctl enable --now cron
+    install -d -m 755 /usr/local/sbin || return
+    install -m 700 "${BASH_SOURCE[0]}" /usr/local/sbin/xray-proxy-setup.new || return
+    mv -f /usr/local/sbin/xray-proxy-setup.new /usr/local/sbin/xray-proxy-setup || return
+    printf '%s\n' "$PROJECT_DOMAIN" > "$STATE_DIR/domain" || return
+    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n@daily root /usr/local/sbin/xray-proxy-setup --update 2>&1 | /usr/bin/logger -t xray-update\n' > "$TEMP_DIR/xray-update" || return
+    install -m 644 "$TEMP_DIR/xray-update" /etc/cron.d/.xray-update.new || return
+    mv -fT /etc/cron.d/.xray-update.new /etc/cron.d/xray-update
 }
 
 disable_unused_services() {
@@ -610,12 +922,14 @@ obtain_certificate() {
 }
 
 write_xray_config() {
-    python3 - "$PROJECT_DOMAIN" "$VLESS_CLIENT_UUID" "$TEMP_DIR/main-outbound.json" "$TEMP_DIR/config.json" <<'PY'
+    python3 - "$PROJECT_DOMAIN" "$TEMP_DIR/main-outbound.json" "$TEMP_DIR/config.json" 3<<< "$VLESS_CLIENT_UUID" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-domain, client_id, main_path, target = sys.argv[1:]
+domain, main_path, target = sys.argv[1:]
+with open(3, encoding="utf-8") as source:
+    client_id = source.read().strip()
 with open(main_path, encoding="utf-8") as source:
     main_outbound = json.load(source)
 config = {
@@ -693,7 +1007,8 @@ configure_bbr() {
     sysctl -p /etc/sysctl.d/99-bbr.conf
 }
 
-configure_firewall() {
+configure_firewall_and_updates() {
+    local was_active=false was_enabled=false rollback_failed=false
     cat > "$TEMP_DIR/nftables.conf" <<'EOF'
 flush ruleset
 table inet xray {
@@ -719,19 +1034,45 @@ EOF
         sed -i '/ct state established,related accept/a\        udp sport 67 udp dport 68 accept' "$TEMP_DIR/nftables.conf"
     fi
     nft --check --file "$TEMP_DIR/nftables.conf"
-    install -m 600 "$TEMP_DIR/nftables.conf" /etc/nftables.conf
-    nft --file /etc/nftables.conf
-    systemctl enable --now nftables
+    systemctl is-active --quiet nftables && was_active=true
+    systemctl is-enabled --quiet nftables && was_enabled=true
+    if [[ -e /etc/nftables.conf || -L /etc/nftables.conf ]]; then
+        cp -a /etc/nftables.conf "$TEMP_DIR/nftables.conf.before"
+    fi
+    { printf 'flush ruleset\n'; nft list ruleset; } > "$TEMP_DIR/nftables.rules.before"
+    if install -m 600 "$TEMP_DIR/nftables.conf" /etc/nftables.conf &&
+        nft --file /etc/nftables.conf && systemctl enable --now nftables && verify_firewall && configure_updates; then
+        return 0
+    fi
+    if [[ -e "$TEMP_DIR/nftables.conf.before" || -L "$TEMP_DIR/nftables.conf.before" ]]; then
+        cp -a "$TEMP_DIR/nftables.conf.before" /etc/nftables.conf || rollback_failed=true
+    else
+        rm -f /etc/nftables.conf || rollback_failed=true
+    fi
+    if [[ "$was_active" == false ]]; then
+        systemctl stop nftables || rollback_failed=true
+    fi
+    if [[ "$was_enabled" == false ]]; then
+        systemctl disable nftables || rollback_failed=true
+    fi
+    nft --file "$TEMP_DIR/nftables.rules.before" || rollback_failed=true
+    [[ "$rollback_failed" == false ]] || fail 'Firewall setup and rollback failed; console access is required.'
+    fail 'Firewall or update setup failed; the previous firewall was restored.'
+}
+
+verify_firewall() {
+    systemctl is-active --quiet nftables || return
+    systemctl is-enabled --quiet nftables || return
+    nft list chain inet xray input | grep -F 'policy drop;' >/dev/null || return
+    nft list chain inet xray forward | grep -F 'policy drop;' >/dev/null
 }
 
 verify_installation() {
     local service
-    for service in nginx xray certbot.timer cron nftables; do
+    for service in nginx xray certbot.timer cron; do
         systemctl is-active --quiet "$service" || fail "Required service is inactive: $service"
         systemctl is-enabled --quiet "$service" || fail "Required service is disabled: $service"
     done
-    nft list chain inet xray input | grep -F 'policy drop;' >/dev/null
-    nft list chain inet xray forward | grep -F 'policy drop;' >/dev/null
     [[ -z "$(ip -6 -o address show)" ]] || fail 'IPv6 addresses are still present.'
     [[ "$(awk '/^nameserver / {print $2}' /etc/resolv.conf)" == $'8.8.8.8\n8.8.4.4\n1.1.1.1' ]] || fail 'Unexpected DNS servers.'
     [[ ! -L /etc/resolv.conf ]] || fail 'resolv.conf must be a static file.'
@@ -759,7 +1100,7 @@ remove_ssh_and_reboot() {
     step 'Removing the SSH server'
     systemctl disable --now ssh.socket 2>/dev/null || true
     systemctl stop sshd-unix-local.socket 2>/dev/null || true
-    apt-get -o DPkg::Lock::Timeout=-1 --auto-remove purge -y openssh-server openssh-sftp-server openssh-client
+    apt-get -o DPkg::Lock::Timeout=-1 purge -y openssh-server openssh-sftp-server openssh-client
     install -d -m 755 /etc/systemd/system-generators
     ln -sfn /dev/null /etc/systemd/system-generators/systemd-ssh-generator
     systemctl mask ssh.service sshd.service ssh.socket sshd-unix-local.socket
@@ -812,6 +1153,8 @@ try:
         reject('The main link must contain a UUID.')
     identity = str(uuid.UUID(identity))
     address = hostname(uri.hostname)
+    if ':' in address:
+        reject('The main address must be an IPv4 address or a hostname.')
     port = uri.port if uri.port is not None else 443
     if not 1 <= port <= 65535:
         reject('Invalid main server port.')
@@ -869,15 +1212,18 @@ import time
 from pathlib import Path
 
 binary, source, parent = sys.argv[1:]
-outbound = json.load(open(source, encoding='utf-8'))
+with open(source, encoding='utf-8') as stream:
+    outbound = json.load(stream)
+target = 'api.ipify.org'
 with tempfile.TemporaryDirectory(prefix='probe-', dir=parent) as folder:
     folder = Path(folder)
-    with socket.socket() as reservation:
-        reservation.bind(('127.0.0.1', 0))
-        port = reservation.getsockname()[1]
+    socket_path = folder / 'https'
     config = {
         'log': {'loglevel': 'error'},
-        'inbounds': [{'listen': '127.0.0.1', 'port': port, 'protocol': 'socks', 'settings': {'auth': 'noauth', 'udp': False}}],
+        'inbounds': [{
+            'listen': str(socket_path), 'protocol': 'tunnel',
+            'settings': {'allowedNetwork': 'tcp', 'rewriteAddress': target, 'rewritePort': 443},
+        }],
         'outbounds': [outbound]
     }
     path = folder / 'config.json'
@@ -892,16 +1238,18 @@ with tempfile.TemporaryDirectory(prefix='probe-', dir=parent) as folder:
                 if process.poll() is not None:
                     raise RuntimeError('The temporary Xray client exited.')
                 try:
-                    with socket.create_connection(('127.0.0.1', port), timeout=0.1):
+                    with socket.socket(socket.AF_UNIX) as connection:
+                        connection.settimeout(0.1)
+                        connection.connect(str(socket_path))
                         break
                 except OSError:
                     time.sleep(0.05)
             else:
                 raise RuntimeError('The temporary Xray client did not start.')
             result = subprocess.run([
-                'curl', '-4', '--fail', '--silent', '--show-error', '--noproxy', '',
-                '--socks5-hostname', f'127.0.0.1:{port}', '--connect-timeout', '10', '--max-time', '25',
-                'https://api.ipify.org'
+                'curl', '--fail', '--silent', '--show-error', '--noproxy', '*',
+                '--unix-socket', str(socket_path), '--connect-timeout', '10', '--max-time', '25',
+                f'https://{target}'
             ], text=True, capture_output=True, timeout=30)
             if result.returncode:
                 raise RuntimeError('The VLESS connection could not fetch https://api.ipify.org. Check main, TLS and connectivity.')
@@ -943,6 +1291,17 @@ for interface in json.loads(subprocess.check_output(['ip', '-j', '-4', 'address'
 if addresses & local or any(ipaddress.ip_address(address).is_loopback for address in addresses):
     raise SystemExit('ERROR: The main address points to this slave; refusing a proxy loop.')
 PY
+}
+
+validate_main_outbound() {
+    python3 - "$TEMP_DIR/main-outbound.json" > "$TEMP_DIR/outbound-check.json" <<'PY' || return
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as source:
+    print(json.dumps({'outbounds': [json.load(source)]}))
+PY
+    XRAY_LOCATION_ASSET="$1" "$1/xray" run -test -config "$TEMP_DIR/outbound-check.json"
 }
 
 prepare_probe_outbounds() {
@@ -995,6 +1354,7 @@ main() {
         PROJECT_DOMAIN="$(cat "$STATE_DIR/domain")"
         validate_domain "$PROJECT_DOMAIN" || fail 'Invalid installed domain.'
         verify_installation
+        verify_firewall || fail 'The firewall is inactive or its rules do not match.'
         verify_chain || fail 'The proxy chain check failed.'
         return
     fi
@@ -1002,6 +1362,10 @@ main() {
     ask_inputs
     step 'Installing packages'
     install_packages
+    step 'Downloading Xray and checking the main link configuration'
+    latest_version
+    download_xray
+    validate_main_outbound "$RELEASE_ROOT/releases/$XRAY_VERSION" || fail 'Xray rejected the main VLESS link configuration.'
     step 'Configuring IPv4-only networking and DNS'
     configure_network
     step 'Removing unused image packages'
@@ -1009,7 +1373,6 @@ main() {
     configure_bbr
     check_domain_dns
     check_main_address
-    step 'Downloading and verifying Xray'
     install_xray
     step 'Checking the main VLESS connection before requesting a certificate'
     probe_outbound /usr/local/bin/xray "$TEMP_DIR/main-outbound.json" >/dev/null || fail 'The main VLESS connection failed; no certificate was requested.'
@@ -1019,15 +1382,15 @@ main() {
     obtain_certificate
     step 'Writing and starting the Xray configuration'
     write_xray_config
-    configure_updates
     step 'Disabling unused services'
     disable_unused_services
-    step 'Allowing inbound HTTP and HTTPS only'
-    configure_firewall
+    systemctl enable --now cron
     step 'Verifying the installation before removing SSH'
     verify_installation
     verify_chain || fail 'The proxy chain check failed; SSH removal and reboot cancelled.'
     print_client
+    step 'Allowing inbound HTTP and HTTPS only'
+    configure_firewall_and_updates
     remove_ssh_and_reboot
 }
 

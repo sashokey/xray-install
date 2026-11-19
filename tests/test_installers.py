@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from urllib.parse import parse_qs, urlsplit
@@ -39,6 +40,389 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.stdout, 'ready')
                 self.assertEqual(list(self.directory.iterdir()), [])
 
+    def test_nginx_packages_can_be_configured_with_kernel_ipv6_disabled(self):
+        body = r'''
+NETWORK_BACKEND=ifupdown
+definition="$(declare -f install_packages; declare -f prepare_nginx_package || :)"
+definition="${definition//\/etc\/nginx/$TEMP_DIR/nginx}"
+definition="${definition//\/proc\/sys\/net\/ipv6/$TEMP_DIR/kernel-ipv6}"
+eval "$definition"
+apt-get() {
+    case " $* " in
+        *' install '*) [[ "$(readlink "$TEMP_DIR/nginx/sites-enabled/default")" == /dev/null ]] ;;
+    esac
+}
+install_packages
+'''
+        for installer in ['setup.sh', 'setup-proxy.sh']:
+            with self.subTest(installer=installer):
+                result = self.run_function(installer, body)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_health_checks_leave_ssh_reachable(self):
+        body = r'''
+for function in preflight ask_inputs install_packages configure_network configure_bbr \
+    check_domain_dns install_xray latest_version download_xray configure_nginx obtain_certificate write_xray_config \
+    disable_unused_services remove_unused_packages check_main_address \
+    probe_outbound validate_main_outbound print_client systemctl; do
+    eval "$function() { :; }"
+done
+configure_firewall_and_updates() { touch "$TEMP_DIR/firewall-applied"; }
+configure_updates() { touch "$TEMP_DIR/updates-configured"; }
+verify_installation() { [[ "$failed_check" != service ]] || fail 'Unhealthy service.'; }
+verify_chain() { [[ "$failed_check" != chain ]]; }
+remove_ssh_and_reboot() { fail 'Unexpected SSH removal.'; }
+main
+'''
+        for installer, check in [('setup.sh', 'service'), ('setup-proxy.sh', 'service'),
+                                 ('setup-proxy.sh', 'chain')]:
+            with self.subTest(installer=installer, check=check):
+                result = self.run_function(installer, 'failed_check="$3"\n' + body, check)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn('Unexpected SSH removal.', result.stderr)
+                self.assertFalse((self.directory / 'firewall-applied').exists())
+                self.assertFalse((self.directory / 'updates-configured').exists())
+
+    def test_ifupdown_preserves_directives_after_removed_ipv6_stanza(self):
+        interfaces = self.directory / 'interfaces'
+        interfaces.write_text(
+            'iface eth0 inet6 \\\n'
+            '    auto\n'
+            'auto\n'
+            '    privext 2\n'
+            'rename ens3=eth0\n'
+            'no-auto-down eth0\n'
+            'no-scripts eth0\n'
+            '# Do not continue this comment \\\n'
+            'iface eth0 inet static\n'
+            '    address 192.0.2.10/24\n'
+            '    description Test interface \\\n'
+            '    # Continued description text\n'
+            '    dns-name\\\n'
+            'servers 192.0.2.53\n'
+            'iface eth0 inet6 auto\n'
+            'auto ens4=ipv6alias\n'
+            'iface ipv6alias inet6 auto\n'
+        )
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\ntest "$1" = --interfaces && test -s "$2" && test "$3" = --list\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(interfaces.read_text().splitlines(), [
+            'auto eth0', 'rename ens3=eth0', 'no-auto-down eth0', 'no-scripts eth0',
+            '# Do not continue this comment \\',
+            'iface eth0 inet static', '    address 192.0.2.10/24',
+            '    description Test interface \\', '    # Continued description text',
+            '    dns-nameservers 8.8.8.8 8.8.4.4 1.1.1.1', '',
+        ])
+
+    def test_ifupdown_validates_included_templates_before_their_use(self):
+        (self.directory / 'interfaces').write_text(
+            'source templates\\ with\\ spaces\n'
+            'auto eth0\n'
+            'iface eth0 inet inherits base\n'
+            '    address 192.0.2.10/24\n'
+        )
+        (self.directory / 'templates with spaces').write_text('iface base inet6 auto\niface base inet static')
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text(
+            '#!/usr/bin/env python3\n'
+            'from pathlib import Path\n'
+            'import shlex\n'
+            'import sys\n'
+            'assert sys.argv[1] == "--interfaces" and sys.argv[3:] == ["--list"]\n'
+            'lines = Path(sys.argv[2]).read_text().splitlines()\n'
+            'assert lines[0].startswith("source /")\n'
+            'include = Path(shlex.split(lines[0])[1]).read_text()\n'
+            'assert "iface base inet static" in include.splitlines()\n'
+            'assert "iface eth0 inet inherits base" in lines\n'
+        )
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ifupdown_keeps_original_files_on_include_diagnostics(self):
+        interfaces = self.directory / 'interfaces'
+        original = 'iface eth0 inet static\n    address 192.0.2.10/24\n'
+        interfaces.write_text(original)
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nprintf "Included file: misplaced option\\n" >&2\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(interfaces.read_text(), original)
+
+    def test_ifupdown_validates_hotplug_selection_before_writing_files(self):
+        interfaces = self.directory / 'interfaces'
+        original = ('iface eth0 inet static\n    address 192.0.2.10/24\n'
+                    'allow-hotplug /eth*\niface eth1 inet6 auto\n')
+        interfaces.write_text(original)
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\ncase " $* " in *" --allow=hotplug "*) exit 1 ;; esac\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(interfaces.read_text(), original)
+
+    def test_ifupdown_rejects_unresolved_mapping_for_an_activated_interface(self):
+        interfaces = self.directory / 'interfaces'
+        original = ('auto ens4=role\nmapping role\n    script /usr/local/sbin/fixture\n'
+                    'iface eth0 inet static\n    address 192.0.2.10/24\niface wan6 inet6 auto\n')
+        interfaces.write_text(original)
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nprintf "ens4\\n"\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(interfaces.read_text(), original)
+
+    def test_ifupdown_preserves_literal_mapping_patterns(self):
+        interfaces = self.directory / 'interfaces'
+        interfaces.write_text('auto ens4=role1\nmapping role\\*\n    script /usr/local/sbin/fixture\n'
+                              'iface role1 inet static\n    address 192.0.2.10/24\niface wan6 inet6 auto\n')
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nprintf "ens4\\n"\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('mapping role\\*\n', interfaces.read_text())
+
+    def test_ifupdown_uses_the_logical_alias_to_check_mappings(self):
+        interfaces = self.directory / 'interfaces'
+        interfaces.write_text('auto /ens*=role1\nmapping ens4\n    script /usr/local/sbin/fixture\n'
+                              'iface role1 inet static\n    address 192.0.2.10/24\niface wan6 inet6 auto\n')
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nprintf "ens4\\n"\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('auto /ens*=role1\n', interfaces.read_text())
+
+    def test_ifupdown_keeps_an_original_selection_needed_for_mapping(self):
+        interfaces = self.directory / 'interfaces'
+        original = ('auto ens4\nmapping ens4\n    script /usr/local/sbin/fixture\n'
+                    'iface role1 inet static\n    address 192.0.2.10/24\niface ens4 inet6 auto\n')
+        interfaces.write_text(original)
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nif grep -qx "auto ens4" "$2"; then printf "ens4\\n"; fi\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(interfaces.read_text(), original)
+
+    def test_ifupdown_preserves_ipv4_selection_after_rename(self):
+        interfaces = self.directory / 'interfaces'
+        selector = '/@(ens4|eno1)' if sys.platform == 'linux' else '/ens*'
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nexit 0\n')
+        ifquery.chmod(0o700)
+        for implicit, rename_source in ((False, selector), (True, selector), (True, 'ens4')):
+            with self.subTest(implicit=implicit, rename_source=rename_source):
+                declarations = f'rename ens4=ens4 {rename_source}=wan4\niface ens4 inet6 auto\n'
+                declarations = declarations + '    auto\n' if implicit else 'auto ens4\n' + declarations
+                interfaces.write_text(declarations + 'iface wan4 inet static\n    address 192.0.2.10/24\n')
+                result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('auto ens4\n', interfaces.read_text())
+                self.assertNotIn('inet6', interfaces.read_text())
+
+    def test_ifupdown_keeps_ipv4_hotplug_when_removing_its_ipv6_alias(self):
+        interfaces = self.directory / 'interfaces'
+        interfaces.write_text('allow-hotplug ens4=wan6\niface ens4 inet static\n'
+                              '    address 192.0.2.10/24\niface wan6 inet6 auto\n')
+        ifquery = self.directory / 'ifquery'
+        ifquery.write_text('#!/bin/sh\nexit 0\n')
+        ifquery.chmod(0o700)
+        result = self.run_function('setup-proxy.sh', '''
+export PATH="$TEMP_DIR:$PATH"
+python3() { command python3 - "$TEMP_DIR/interfaces" "$3"; }
+configure_ifupdown
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('allow-hotplug ens4\n', interfaces.read_text())
+        self.assertNotIn('inet6', interfaces.read_text())
+
+    def test_dns_failure_is_distinct_from_an_absent_aaaa_record(self):
+        body = '''
+PROJECT_DOMAIN=server.example
+dig() {
+    case "$*" in
+        *' A '*) printf ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\nserver.example. 60 IN A 192.0.2.10\\n' ;;
+        *' AAAA '*)
+            printf ';; ->>HEADER<<- opcode: QUERY, status: %s, id: 2\\n' "$aaaa_status"
+            if [[ "$aaaa_status" == NOERROR && "$aaaa_present" == yes ]]; then
+                printf 'server.example. 60 IN AAAA 2001:db8::10\\n'
+            fi
+            ;;
+        *) return 98 ;;
+    esac
+}
+aaaa_status="$3" aaaa_present="$4"
+check_domain_dns
+'''
+        for installer in ['setup.sh', 'setup-proxy.sh']:
+            for status, present, exit_code in [('NOERROR', 'no', 0), ('NOERROR', 'yes', 1),
+                                               ('SERVFAIL', 'no', 1), ('NXDOMAIN', 'no', 1)]:
+                with self.subTest(installer=installer, status=status, present=present):
+                    result = self.run_function(installer, body, status, present)
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+
+    def test_slave_keeps_the_installed_cloud_init_yaml_dependency(self):
+        body = r'''
+NETWORK_BACKEND=ifupdown
+dpkg-query() {
+    case "$3" in
+        cloud-init|python3-yaml) printf installed ;;
+        *) return 1 ;;
+    esac
+}
+apt-get() { printf 'Unexpected purge: %s\n' "$*"; return 97; }
+remove_unused_packages
+'''
+        result = self.run_function('setup-proxy.sh', body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_slave_rejects_an_incompatible_outbound_before_network_changes(self):
+        result = self.run_function('setup-proxy.sh', r'''
+preflight() { :; }
+ask_inputs() { :; }
+install_packages() { :; }
+latest_version() { :; }
+download_xray() { :; }
+validate_main_outbound() { return 1; }
+configure_network() { printf 'Network changes started.\n'; exit 97; }
+main
+''')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn('Network changes started.', result.stdout)
+
+    def test_netplan_and_resolver_failures_restore_the_previous_configuration(self):
+        body = r'''
+NETWORK_BACKEND=netplan
+STATE_DIR="$TEMP_DIR/state"
+mkdir -p "$TEMP_DIR/etc" "$TEMP_DIR/netplan-config"
+ln -s "$TEMP_DIR/netplan-config" "$TEMP_DIR/etc/netplan"
+printf 'original\n' > "$TEMP_DIR/original.yaml"
+ln -s "$TEMP_DIR/original.yaml" "$TEMP_DIR/etc/netplan/50-cloud.yaml"
+printf 'resolvers\n' > "$TEMP_DIR/etc/resolv.conf"
+definition="$(declare -f configure_network)"
+definition="${definition//\/etc\//$TEMP_DIR/etc/}"
+definition="${definition//\/var\/$TEMP_DIR/var/}"
+eval "$definition"
+python3() { printf 'rewritten\n' > "${2:-$TEMP_DIR/etc/netplan}/50-cloud.yaml"; }
+netplan() {
+    if [[ "$1" == apply ]]; then
+        [[ "$failure" == dns ]] || grep -qx original "$TEMP_DIR/etc/netplan/50-cloud.yaml"
+    fi
+}
+getent() { return 1; }
+ip() { :; }
+failure="$3"
+configure_network
+'''
+        for installer in ['setup.sh', 'setup-proxy.sh']:
+            for failure in ('apply', 'dns'):
+                with self.subTest(installer=installer, failure=failure):
+                    case_dir = self.directory / f'{installer}-{failure}'
+                    case_dir.mkdir()
+                    result = self.run_function(installer, 'TEMP_DIR="$TEMP_DIR/$4"\n' + body, failure, case_dir.name)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn('the original configuration was restored.', result.stderr)
+                    self.assertTrue((case_dir / 'etc/netplan').is_symlink())
+                    self.assertTrue((case_dir / 'etc/netplan/50-cloud.yaml').is_symlink())
+                    self.assertEqual((case_dir / 'original.yaml').read_text(), 'original\n')
+                    self.assertEqual((case_dir / 'etc/netplan/50-cloud.yaml').read_text(), 'original\n')
+                    self.assertEqual((case_dir / 'etc/resolv.conf').read_text(), 'resolvers\n')
+                    self.assertFalse((case_dir / 'etc/cloud/cloud.cfg.d/99-xray-network.cfg').exists())
+
+    def test_ifupdown_write_failure_restores_original_files(self):
+        result = self.run_function('setup-proxy.sh', r'''
+NETWORK_BACKEND=ifupdown
+STATE_DIR="$TEMP_DIR/state"
+mkdir -p "$TEMP_DIR/etc/network"
+printf 'original\n' > "$TEMP_DIR/etc/network/interfaces"
+printf 'resolvers\n' > "$TEMP_DIR/etc/resolv.conf"
+definition="$(declare -f configure_network)"
+definition="${definition//\/etc\//$TEMP_DIR/etc/}"
+definition="${definition//\/var\/$TEMP_DIR/var/}"
+eval "$definition"
+configure_ifupdown() {
+    printf 'partially changed\n' > "$TEMP_DIR/etc/network/interfaces"
+    return 2
+}
+configure_network
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((self.directory / 'etc/network/interfaces').read_text(), 'original\n')
+
+    def test_firewall_verification_failure_restores_the_previous_rules_and_file(self):
+        body = r'''
+NETWORK_BACKEND=ifupdown
+printf 'original firewall\n' > "$TEMP_DIR/firewall.conf"
+definition="$(declare -f configure_firewall_and_updates)"
+definition="${definition//\/etc\/nftables.conf/$TEMP_DIR/firewall.conf}"
+eval "$definition"
+systemctl() { :; }
+configure_updates() { return 1; }
+failure="$3"
+nft() {
+    case "$*" in
+        '--check --file '*) ;;
+        'list ruleset') printf 'original rules\n' ;;
+        'list chain '*)
+            [[ "$failure" == updates ]] && printf 'policy drop;\n'
+            ;;
+        '--file '*) cat "$2" > "$TEMP_DIR/active-rules" ;;
+        *) return 97 ;;
+    esac
+}
+configure_firewall_and_updates
+'''
+        for installer in ['setup.sh', 'setup-proxy.sh']:
+            for failure in ('firewall', 'updates'):
+                with self.subTest(installer=installer, failure=failure):
+                    result = self.run_function(installer, body, failure)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual((self.directory / 'firewall.conf').read_text(), 'original firewall\n')
+                    self.assertEqual((self.directory / 'active-rules').read_text(), 'flush ruleset\noriginal rules\n')
+
     def test_daily_update_reboots_only_after_a_successful_target_upgrade(self):
         body = r'''
 TEMP_DIR="$(mktemp -d "$TEMP_DIR/daily.XXXXXXXX")"
@@ -60,10 +444,21 @@ dpkg-query() {
     cat "$TEMP_DIR/nginx-version"
 }
 check_fallback() { return 0; }
-verify_chain() { return 0; }
+verify_chain() {
+    if [[ "$xray_result" == chain-fail && -f "$TEMP_DIR/candidate-active" ]]; then
+        return 1
+    fi
+}
 readlink() { printf '%s/releases/1\n' "$RELEASE_ROOT"; }
 download_xray() { [[ "$xray_result" != download-fail ]]; }
-switch_release() { printf 'event: release %s\n' "${1##*/}"; }
+switch_release() {
+    printf 'event: release %s\n' "${1##*/}"
+    if [[ "${1##*/}" == 2 ]]; then
+        touch "$TEMP_DIR/candidate-active"
+    else
+        rm -f "$TEMP_DIR/candidate-active"
+    fi
+}
 restart_xray_checked() {
     printf 'event: restart xray\n'
     if [[ "$xray_result" == rollback && ! -e "$TEMP_DIR/retried" ]]; then
@@ -111,7 +506,6 @@ latest_version() { XRAY_VERSION="$xray_version"; }
 simulated_nginx_version="$5"
 apt_result="$6"
 xray_result="$7"
-main --update
 '''
         current = ['lock']
         xray = ['release 2', 'restart xray']
@@ -134,11 +528,28 @@ main --update
             ]:
                 with self.subTest(installer=installer, version=version, before=before, after=after,
                                   apt_result=apt_result, xray_result=xray_result):
-                    result = self.run_function(installer, body, version, before, after, apt_result, xray_result)
+                    result = self.run_function(installer, body + '\nmain --update', version, before, after,
+                                               apt_result, xray_result)
                     events = [line.removeprefix('event: ') for line in result.stdout.splitlines()
                               if line.startswith('event: ')]
                     self.assertEqual(events, current + actions, result.stdout + result.stderr)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+        result = self.run_function('setup-proxy.sh', body + '''
+main --update &
+if wait "$!"; then
+    exit 93
+fi
+if [[ -e "$STATE_DIR/rejected-version" ]]; then
+    exit 94
+fi
+xray_result=ok
+main --update
+''', '2', '1', '1', 'ok', 'chain-fail')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('event: release 2\n'), 2)
+        self.assertIn('event: release 1\n', result.stdout)
+        self.assertIn('event: systemctl reboot\n', result.stdout)
 
     @unittest.skipUnless(MODERN_BASH, 'Domain and interactive input checks require the supported Debian Bash 5 runtime')
     def test_domain_validation_accepts_only_dns_labels(self):
@@ -206,6 +617,7 @@ main --update
     def test_proxy_link_rejects_invalid_or_unsupported_connections(self):
         base = 'vless://' + UUID + '@main.example:443?security=tls&flow=xtls-rprx-vision'
         links = [base.replace('vless:', 'https:'), base.replace(UUID, 'invalid'), base.replace(':443?', ':0?'), base.replace(':443?', ':65536?'), base + '&security=tls', base + '&allowInsecure=1', base + '&type=ws', base + '&unknown=value', base.replace('security=tls', 'security=none'), base.replace('xtls-rprx-vision', 'none'), base + '&sni=bad%ZZ', base + '&alpn=h3', base.replace('main.example', 'slave.example'), base.replace('main.example', '-bad.example')]
+        links.append(base.replace('main.example', '[2001:db8::10]'))
         for link in links:
             with self.subTest(link=link):
                 target = self.directory / 'outbound.json'
@@ -221,7 +633,18 @@ main --update
             with self.subTest(installer=installer):
                 main = {'tag': 'main', 'protocol': 'vless', 'settings': {'vnext': [{'address': 'main.example', 'port': 443, 'users': [{'id': UUID, 'encryption': 'none', 'flow': 'xtls-rprx-vision'}]}]}}
                 (self.directory / 'main-outbound.json').write_text(json.dumps(main))
-                result = self.run_function(installer, 'PROJECT_DOMAIN=slave.example\nVLESS_CLIENT_UUID="$3"\npython3() { command python3 "$@"; return 91; }\nwrite_xray_config', UUID)
+                result = self.run_function(installer, '''
+PROJECT_DOMAIN=slave.example
+VLESS_CLIENT_UUID="$3"
+python3() {
+    for argument in "$@"; do
+        [[ "$argument" != "$VLESS_CLIENT_UUID" ]] || return 92
+    done
+    command python3 "$@" || return
+    return 91
+}
+write_xray_config
+''', UUID)
                 self.assertEqual(result.returncode, 91, result.stderr)
                 config = json.loads((self.directory / 'config.json').read_text())
                 inbound = config['inbounds'][0]

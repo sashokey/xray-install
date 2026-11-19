@@ -39,6 +39,107 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.stdout, 'ready')
                 self.assertEqual(list(self.directory.iterdir()), [])
 
+    def test_daily_update_reboots_only_after_a_successful_target_upgrade(self):
+        body = r'''
+TEMP_DIR="$(mktemp -d "$TEMP_DIR/daily.XXXXXXXX")"
+STATE_DIR="$TEMP_DIR/state"
+RELEASE_ROOT="$TEMP_DIR/xray"
+mkdir -p "$STATE_DIR" "$RELEASE_ROOT/releases/1" "$RELEASE_ROOT/releases/2"
+printf 'server.example\n' > "$STATE_DIR/domain"
+printf '#!/bin/bash\nexit 0\n' > "$RELEASE_ROOT/releases/1/xray"
+cp "$RELEASE_ROOT/releases/1/xray" "$RELEASE_ROOT/releases/2/xray"
+chmod +x "$RELEASE_ROOT/releases/"*/xray
+printf '%s' "$4" > "$TEMP_DIR/nginx-version"
+lock_setup() { printf 'event: lock\n'; }
+validate_domain() { return 0; }
+function /usr/local/bin/xray { printf 'Xray 1\n'; }
+dpkg() { [[ "$1" == --compare-versions && "$3" == gt && "$2" > "$4" ]]; }
+dpkg-query() {
+    [[ "$*" == '-W -f=${Version} nginx' ]] || return 99
+    [[ -s "$TEMP_DIR/nginx-version" ]] || return 1
+    cat "$TEMP_DIR/nginx-version"
+}
+check_fallback() { return 0; }
+verify_chain() { return 0; }
+readlink() { printf '%s/releases/1\n' "$RELEASE_ROOT"; }
+download_xray() { [[ "$xray_result" != download-fail ]]; }
+switch_release() { printf 'event: release %s\n' "${1##*/}"; }
+restart_xray_checked() {
+    printf 'event: restart xray\n'
+    if [[ "$xray_result" == rollback && ! -e "$TEMP_DIR/retried" ]]; then
+        touch "$TEMP_DIR/retried"
+        return 1
+    fi
+}
+apt-get() {
+    case " $* " in
+        *' update '*)
+            printf 'event: apt update\n'
+            if [[ "$apt_result" == external-upgrade ]]; then
+                printf '%s' "$simulated_nginx_version" > "$TEMP_DIR/nginx-version"
+            fi
+            [[ "$apt_result" != update-fail ]]
+            ;;
+        *' upgrade '*)
+            local option hook='' previous_version
+            printf 'event: apt upgrade\n'
+            [[ "$DEBIAN_FRONTEND" == noninteractive && "$*" == *'--force-confold'* && "$*" == *'--with-new-pkgs'* ]] || return 99
+            case " $* " in *' -y '* | *' --assume-yes '*) ;; *) return 99 ;; esac
+            for option in "$@"; do
+                case "$option" in DPkg::Pre-Install-Pkgs::=*) hook="${option#*=}" ;; esac
+            done
+            if [[ -n "$hook" ]]; then
+                [[ "$*" == *"DPkg::Tools::options::${hook%% *}::Version=2"* ]] || return 99
+                previous_version="$(cat "$TEMP_DIR/nginx-version")"
+                {
+                    printf 'VERSION 2\nAPT::Get::Assume-Yes=1\n\n'
+                    printf 'curl 1 < 2 /var/cache/apt/archives/curl.deb\n'
+                    if [[ -n "$simulated_nginx_version" && "$previous_version" != "$simulated_nginx_version" ]]; then
+                        printf 'nginx %s < %s /var/cache/apt/archives/nginx.deb\n' "${previous_version:--}" "$simulated_nginx_version"
+                    fi
+                } | /bin/sh -c "$hook"
+            fi
+            printf '%s' "$simulated_nginx_version" > "$TEMP_DIR/nginx-version"
+            [[ "$apt_result" != upgrade-fail ]]
+            ;;
+        *) return 99 ;;
+    esac
+}
+systemctl() { printf 'event: systemctl %s\n' "$*"; }
+xray_version="$3"
+latest_version() { XRAY_VERSION="$xray_version"; }
+simulated_nginx_version="$5"
+apt_result="$6"
+xray_result="$7"
+main --update
+'''
+        current = ['lock']
+        xray = ['release 2', 'restart xray']
+        apt = ['apt update', 'apt upgrade']
+        reboot = ['systemctl reboot']
+        for installer in ['setup.sh', 'setup-proxy.sh']:
+            for version, before, after, apt_result, xray_result, status, actions in [
+                ('1', '1', '1', 'ok', 'ok', 0, apt),
+                ('1', '', '', 'ok', 'ok', 0, apt),
+                ('1', '', '2', 'ok', 'ok', 0, apt),
+                ('1', '1', '2', 'external-upgrade', 'ok', 0, apt),
+                ('1', '1', '2', 'ok', 'ok', 0, apt + reboot),
+                ('2', '1', '1', 'ok', 'ok', 0, xray + apt + reboot),
+                ('2', '1', '2', 'ok', 'ok', 0, xray + apt + reboot),
+                ('1', '1', '2', 'update-fail', 'ok', 1, apt[:1]),
+                ('1', '1', '2', 'upgrade-fail', 'ok', 1, apt),
+                ('2', '1', '2', 'upgrade-fail', 'ok', 1, xray + apt + reboot),
+                ('2', '1', '2', 'ok', 'download-fail', 1, apt + reboot),
+                ('2', '1', '1', 'ok', 'rollback', 1, xray + ['release 1', 'restart xray'] + apt),
+            ]:
+                with self.subTest(installer=installer, version=version, before=before, after=after,
+                                  apt_result=apt_result, xray_result=xray_result):
+                    result = self.run_function(installer, body, version, before, after, apt_result, xray_result)
+                    events = [line.removeprefix('event: ') for line in result.stdout.splitlines()
+                              if line.startswith('event: ')]
+                    self.assertEqual(events, current + actions, result.stdout + result.stderr)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
     @unittest.skipUnless(MODERN_BASH, 'Domain and interactive input checks require the supported Debian Bash 5 runtime')
     def test_domain_validation_accepts_only_dns_labels(self):
         for installer in ['setup.sh', 'setup-proxy.sh']:

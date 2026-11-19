@@ -325,12 +325,47 @@ update_xray() {
     if restart_xray_checked; then
         rm -f "$STATE_DIR/rejected-version"
         printf 'Xray updated from %s to %s.\n' "$installed" "$XRAY_VERSION"
+        touch "$TEMP_DIR/reboot-required"
     else
         switch_release "$previous"
         printf '%s\n' "$XRAY_VERSION" > "$STATE_DIR/rejected-version"
         restart_xray_checked || fail 'Update and rollback failed; console access is required.'
         fail "Xray $XRAY_VERSION failed its health check; restored $installed."
     fi
+}
+
+upgrade_packages() {
+    local nginx_upgrade="$TEMP_DIR/nginx-upgrade"
+    local package_filter='
+        NR == 1 { version_ok = ($0 == "VERSION 2") }
+        version_ok && !NF { package_actions = 1 }
+        package_actions && $1 == "nginx" && $2 != "-" && $3 == "<" && $5 ~ /^\// {
+            printf "Nginx updated from %s to %s.\n", $2, $4
+        }
+    '
+    apt-get -o Acquire::ForceIPv4=true --error-on=any update
+    APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l UCF_FORCE_CONFFOLD=1 \
+        apt-get -o DPkg::Lock::Timeout=-1 -o Acquire::ForceIPv4=true \
+            -o "DPkg::Pre-Install-Pkgs::=/usr/bin/awk '$package_filter' >> '$nginx_upgrade'" \
+            -o DPkg::Tools::options::/usr/bin/awk::Version=2 \
+            -o Dpkg::Options::=--force-confold --with-new-pkgs -y upgrade </dev/null
+    if [[ -s "$nginx_upgrade" ]]; then
+        cat "$nginx_upgrade"
+        touch "$TEMP_DIR/reboot-required"
+    fi
+}
+
+update_system() {
+    local failed=0
+    update_xray &
+    wait "$!" || failed=1
+    upgrade_packages &
+    wait "$!" || failed=1
+    if [[ -f "$TEMP_DIR/reboot-required" ]]; then
+        printf 'Rebooting after a successful Nginx or Xray update.\n'
+        systemctl reboot
+    fi
+    return "$failed"
 }
 
 configure_updates() {
@@ -575,7 +610,7 @@ main() {
     [[ $# -eq 0 || ( $# -eq 1 && "$1" == --update ) ]] || fail 'Usage: setup.sh [--update]'
     if [[ "${1:-}" == --update ]]; then
         lock_setup
-        update_xray
+        update_system
         return
     fi
     preflight
